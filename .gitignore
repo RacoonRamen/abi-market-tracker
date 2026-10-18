@@ -1,0 +1,19 @@
+# Secrets — 絕不能上傳
+token.txt
+bot_config.json
+bot_alert_state.json
+watch_state.json
+*.token
+*.env
+
+# Runtime logs
+bot_log.txt
+bot_err.txt
+tv_tracker_log.txt
+tv_scan*.log
+full_scan*.log
+*_log.json
+
+# Python
+__pycache__/
+*.pyc

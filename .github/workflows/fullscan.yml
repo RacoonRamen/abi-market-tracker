@@ -1,0 +1,33 @@
+name: fullscan
+on:
+  schedule:
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+concurrency:
+  group: crawl
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install playwright
+      - run: python -m playwright install --with-deps chromium
+      - run: python abi_tracker.py --all --grid-only --csv prices_all_full.csv
+      - run: python abi_history.py --minor 104,10101,10102,10103,10104,10105,10106,10108,10201,20101,20102,20103,20104,20105,20106,20107,20108,20110,20111,20112,20114,20115,20116,20201,20202,20203,20204,20205,20206,20208,20209,20210,20212,20213,20214,20215,20217,30102,30103,30104,30105,30106,3010101,3010102,3011502,40101,40103,40104,40105,40401,40402,40501,40502,40503,40504,40507,40801,40802,40803,40804,40805,40806,40807,40808,40809,40810,40812,40813,40814 --budget 12 --out history.json
+      - run: python abi_top5.py --csv prices_all_full.csv --out top5_report_full.md
+      - run: python abi_page.py --csv prices_all_full.csv --hist tv_keys.csv --history history.json --json snapshot.json
+      - name: Commit data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add prices_all_full.csv tv_keys.csv history.json history_state.json dashboard.html snapshot.json top5_report_full.md
+          git diff --cached --quiet || (git commit -m "full market scan" && git push)
