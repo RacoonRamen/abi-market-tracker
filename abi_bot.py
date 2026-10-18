@@ -15,9 +15,12 @@
 import json
 import os
 import sys
+from unicodedata import east_asian_width
 
 import discord
 from discord.ext import commands, tasks
+
+import abi_charts
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SNAPSHOT = os.path.join(HERE, "snapshot.json")
@@ -43,6 +46,22 @@ def save_json(path, data):
 
 def fmt(n):
     return f"{n:,.0f}"
+
+
+# ===== 全形寬度感知表格對齊 =====
+def _w(s):
+    return sum(2 if east_asian_width(c) in "WF" else 1 for c in str(s))
+
+
+def _pad(s, n):
+    s = str(s)
+    return s + " " * max(0, n - _w(s))
+
+
+def table(rows):
+    cols = len(rows[0])
+    widths = [max(_w(r[i]) for r in rows) for i in range(cols)]
+    return "\n".join(" ".join(_pad(r[i], widths[i]) for i in range(cols)).rstrip() for r in rows)
 
 
 class AbiBot(commands.Bot):
@@ -82,6 +101,7 @@ class AbiBot(commands.Bot):
         names = {i["id"]: i["name"] for i in items.values()}
         label = {"deep": "💰💰 歷史深跌 (難得機會, 多囤幾把!)", "buy": "💰 補貨時機 (低於平常便宜價)",
                  "sell": "高價區 (先別買)", "wait": "⏸ 回到觀望區"}
+        color = {"deep": 0x3fbf7f, "buy": 0x3fbf7f, "sell": 0xf0b429, "wait": 0x8b93a5}
         lines = []
         for k, v in changes.items():
             it = items[k]
@@ -96,7 +116,10 @@ class AbiBot(commands.Bot):
         if not chan_id or not lines:
             return
         chan = self.get_channel(int(chan_id)) or await self.fetch_channel(int(chan_id))
-        await chan.send("🔑 **電視台鑰匙訊號更新**\n```\n" + "\n".join(lines)[:1700] + "\n```")
+        emb = discord.Embed(title="🔑 電視台鑰匙訊號更新",
+                            color=color[changes[list(changes)[0]]],
+                            description="\n".join(lines)[:2000])
+        await chan.send(embed=emb)
 
     @alert_loop.before_loop
     async def before_alert(self):
@@ -129,7 +152,7 @@ async def keys_cmd(ctx):
     snap = bot.snapshot()
     pool = sorted((i for i in snap.get("items", []) if i["minor"] == TV_MINOR),
                   key=lambda i: -i["low"])
-    lines = ["鑰匙 | 現價 | 補貨價 | 深跌價 | 平常高價 | 距補貨 | 狀態"]
+    rows = [["鑰匙", "現價", "補貨價", "深跌價", "平常高價", "距補貨", "狀態"]]
     for i in pool:
         if not i.get("buy_price"):
             continue
@@ -142,9 +165,9 @@ async def keys_cmd(ctx):
             st = "高價中(別急買)"
         else:
             st = "—觀望"
-        lines.append(f"{i['name']} | {fmt(i['low'])} | {fmt(i['buy_price'])} | "
-                     f"{fmt(i.get('deep_buy', 0))} | {fmt(i['sell_target'])} | {dist:+.1f}% | {st}")
-    await ctx.send("🔑 **電視台鑰匙補貨推薦**\n```\n" + "\n".join(lines)[:1900] + "\n```")
+        rows.append([i["name"], fmt(i["low"]), fmt(i["buy_price"]), fmt(i.get("deep_buy", 0)),
+                     fmt(i["sell_target"]), f"{dist:+.1f}%", st])
+    await ctx.send("🔑 **電視台鑰匙補貨推薦**\n```\n" + table(rows)[:1900] + "\n```")
 
 
 @bot.command(name="sell")
@@ -160,14 +183,14 @@ async def sell_cmd(ctx, *, query=""):
         pool.append(i)
     pool.sort(key=lambda i: -i.get("score", 0))
     head = "💰 **賣出推薦 Top 15**" + (f" [篩選: {query}]" if q else "")
-    lines = ["物品 | 淨收入 | 在售 | 好賣度 | 價格分 | 推薦分"]
-    for i in pool[:15]:
-        price_q = f"區間頂{i['pos_pct']}%" if i.get("pos_pct") else (f"估價比{i['ref_ratio']*100:.0f}%" if i.get("ref_ratio") else "-")
-        lines.append(f"{i['name']} | {fmt(i['low']*0.935)} | {fmt(i.get('count',0))} | "
-                     f"{sell_grade(i)} | {price_q} | {fmt(i['score'])}")
     if not pool:
         await ctx.send("找不到符合的物品"); return
-    await ctx.send(head + "\n```\n" + "\n".join(lines)[:1900] + "\n```")
+    rows = [["物品", "淨收入", "在售", "好賣度", "價格分", "推薦分"]]
+    for i in pool[:15]:
+        price_q = f"區間頂{i['pos_pct']}%" if i.get("pos_pct") else (f"估價比{i['ref_ratio']*100:.0f}%" if i.get("ref_ratio") else "-")
+        rows.append([i["name"], fmt(i["low"] * 0.935), fmt(i.get("count", 0)),
+                     sell_grade(i), price_q, fmt(i["score"])])
+    await ctx.send(head + "\n```\n" + table(rows)[:1900] + "\n```")
 
 
 @bot.command(name="price")
@@ -190,9 +213,38 @@ async def price_cmd(ctx, *, query=""):
         emb.add_field(name="好賣度", value=sell_grade(i), inline=True)
         emb.add_field(name="日成交額", value=fmt(i.get("turnover", 0)) if i.get("turnover") else "-", inline=True)
         emb.add_field(name="系統估價", value=fmt(i.get("ref", 0)) if i.get("ref") else "-", inline=True)
+        files = []
+        try:
+            png = os.path.join(HERE, f"chart_{i['id']}.png")
+            abi_charts.make_item_chart(i, png)
+            files.append(discord.File(png, filename=f"chart_{i['id']}.png"))
+            emb.set_image(url=f"attachment://chart_{i['id']}.png")
+        except Exception:
+            pass
         if i.get("buy_price"):
             emb.add_field(name="補貨模型", value=f"補貨價 {fmt(i['buy_price'])} / 深跌價 {fmt(i.get('deep_buy', 0))}, 現價距 {(i['low']/i['buy_price']-1)*100:+.1f}%", inline=False)
-        await ctx.send(embed=emb)
+        await ctx.send(embed=emb, files=files)
+        for f in files:
+            try:
+                os.remove(f.fp.name)
+            except Exception:
+                pass
+
+
+@bot.command(name="chart")
+async def chart_cmd(ctx):
+    snap = bot.snapshot()
+    tv = sorted((i["name"], i) for i in snap.get("items", []) if i["minor"] == TV_MINOR)
+    tv.sort(key=lambda x: -x[1]["low"])
+    if not tv:
+        await ctx.send("找不到電視台鑰匙資料"); return
+    png = os.path.join(HERE, "tv_overview.png")
+    abi_charts.make_overview_chart(tv, png)
+    await ctx.send(file=discord.File(png, filename="tv_overview.png"))
+    try:
+        os.remove(png)
+    except Exception:
+        pass
 
 
 @bot.command()
@@ -214,9 +266,9 @@ async def stopalert(ctx):
 
 @bot.command(name="help")
 async def help_cmd(ctx):
-    await ctx.send("```\n!keys  電視台鑰匙買入推薦\n!sell [關鍵字]  賣出推薦 Top15\n"
-                   "!price 物品關鍵字  單一物品評估\n!setalert #頻道  設定訊號警示\n"
-                   "!stopalert  停止警示\n```")
+    await ctx.send("```\n!keys  電視台鑰匙補貨推薦\n!chart  鑰匙 30 天價格總覽圖\n"
+                   "!sell [關鍵字]  賣出推薦 Top15\n!price 物品關鍵字  物品評估(附圖)\n"
+                   "!setalert #頻道  設定訊號警示\n!stopalert  停止警示\n```")
 
 
 if __name__ == "__main__":
