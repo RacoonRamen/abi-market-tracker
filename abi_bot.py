@@ -399,6 +399,34 @@ def sell_grade(i):
     return "低競爭" if c < 1000 else ("中" if c < 10000 else "高競爭")
 
 
+@bot.command(name="top")
+async def top_cmd(ctx, n: int = 20):
+    """雜物 TopN 賣出推薦 (Discord Markdown 呈現), 例: !top / !top 10"""
+    n = max(1, min(n, 25))
+    snap = bot.snapshot()
+    pool = [i for i in snap.get("items", []) if str(i.get("major")) == "408"]
+    pool.sort(key=lambda i: -i.get("score", 0))
+    if not pool:
+        await ctx.send("沒有資料 (snapshot.json 缺失或還沒建)"); return
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for rank, i in enumerate(pool[:n], 1):
+        if i.get("turnover") and i.get("stock_days", 0) and i["stock_days"] < 1:
+            adv = " 🥇優先蒐集"
+        elif i.get("count", 0) < 1000 and i["low"] > i.get("ref", 0) * 1.5 and i["low"] > 100000:
+            adv = " 💎稀有好貨"
+        elif i.get("count", 0) >= 10000:
+            adv = " ⚠供過於求"
+        else:
+            adv = ""
+        mark = medals[rank - 1] + " " if rank <= 3 else f"`{rank}.` "
+        lines.append(f"{mark}**{i['name']}** — 淨收入 `{fmt(i['low'] * 0.935)}` · "
+                     f"在售 `{fmt(i.get('count', 0))}` · {sell_grade(i)}{adv}")
+    emb = discord.Embed(title=f"📦 雜物賣出推薦 Top{n}", description="\n".join(lines), color=0xf0b429)
+    emb.set_footer(text=f"資料更新於 {snap.get('generated', '')}")
+    await ctx.send(embed=emb)
+
+
 @bot.command(name="price")
 async def price_cmd(ctx, *, query=""):
     query = query.strip().lower()
@@ -453,7 +481,7 @@ async def stopalert(ctx):
 @bot.command(name="help")
 async def help_cmd(ctx):
     await ctx.send("```\n!keys    電視台鑰匙補貨推薦\n!chart30 30天每日區間圖\n!chart100 近100天週區間圖\n"
-                   "!sell [關鍵字]  賣出推薦 Top15\n!price 物品關鍵字  單品評估卡+圖表\n"
+                   "!sell [關鍵字]  賣出推薦 Top15\n!top [數量]  雜物賣出推薦 Top20\n!price 物品關鍵字  單品評估卡+圖表\n"
                    "!setalert #頻道  設定訊號警示\n!stopalert  停止警示\n```")
 
 
