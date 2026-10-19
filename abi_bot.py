@@ -229,6 +229,46 @@ def item_chart_png(item, h, out_path):
     return out_path
 
 
+def top_table_png(items, out_path, title=None):
+    """雜物 TopN 表格圖 (深色主題, 金字+斑馬紋)"""
+    plt = _plt()
+    rows = []
+    for rank, i in enumerate(items, 1):
+        if i.get("turnover") and i.get("stock_days", 0) and i["stock_days"] < 1:
+            adv = "優先蒐集"
+        elif i.get("count", 0) < 1000 and i["low"] > i.get("ref", 0) * 1.5 and i["low"] > 100000:
+            adv = "稀有好貨"
+        elif i.get("count", 0) >= 10000:
+            adv = "供過於求"
+        else:
+            adv = ""
+        name = i["name"][:13] + "…" if len(i["name"]) > 14 else i["name"]
+        rows.append([rank, name, fmt(i["low"] * 0.935),
+                     fmt(i.get("count", 0)), sell_grade(i), adv])
+    n = len(rows)
+    fig, ax = plt.subplots(figsize=(11, 0.42 * n + 0.9), facecolor=BG)
+    ax.axis("off")
+    plt.subplots_adjust(top=0.88, bottom=0.02, left=0.01, right=0.99)
+    ax.set_title(title or f"雜物賣出推薦 Top{n}", color=GOLD, fontsize=15, pad=12)
+    tab = ax.table(cellText=rows,
+                   colLabels=["#", "物品", "淨收入", "在售", "好賣度", "建議"],
+                   loc="center", colWidths=[0.06, 0.38, 0.16, 0.12, 0.13, 0.15])
+    tab.auto_set_font_size(False)
+    tab.set_fontsize(10.5)
+    for (r, c), cell in tab.get_celld().items():
+        cell.set_edgecolor(LINE)
+        if r == 0:
+            cell.set_facecolor(PANEL)
+            cell.get_text().set_color(GOLD)
+            cell.get_text().set_weight("bold")
+        else:
+            cell.set_facecolor("#151a22" if r % 2 else "#10141b")
+            cell.get_text().set_color("#e6e9f0")
+    fig.savefig(out_path, dpi=130, facecolor=BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
 # ==================== Bot ====================
 class AbiBot(commands.Bot):
     def __init__(self):
@@ -399,12 +439,29 @@ def sell_grade(i):
     return "低競爭" if c < 1000 else ("中" if c < 10000 else "高競爭")
 
 
-@bot.command(name="top")
-async def top_cmd(ctx, n: int = 20):
-    """雜物 TopN 賣出推薦 (Discord Markdown 呈現), 例: !top / !top 10"""
+RARITY_MAP = None
+
+
+def rarity_of(item_id):
+    """items_index.json 稀有度對照 (快取): 5=金 4=紫 3=藍"""
+    global RARITY_MAP
+    if RARITY_MAP is None:
+        try:
+            raw = load_json(os.path.join(HERE, "items_index.json"), {}) or {}
+            RARITY_MAP = {str(k): v.get("rarity") for k, v in (raw.get("items") or {}).items()}
+        except Exception:
+            RARITY_MAP = {}
+    return RARITY_MAP.get(str(item_id))
+
+
+async def _top_misc(ctx, rarity, kind, color, n=20):
+    """雜物指定稀有度 TopN (rarity=None 全部), 例: !topg 10"""
     n = max(1, min(n, 25))
+    label = f"{kind}色雜物" if kind else "雜物"
     snap = bot.snapshot()
-    pool = [i for i in snap.get("items", []) if str(i.get("major")) == "408"]
+    pool = [i for i in snap.get("items", [])
+            if str(i.get("major")) == "408"
+            and (rarity is None or rarity_of(i.get("id")) == rarity)]
     pool.sort(key=lambda i: -i.get("score", 0))
     if not pool:
         await ctx.send("沒有資料 (snapshot.json 缺失或還沒建)"); return
@@ -422,9 +479,37 @@ async def top_cmd(ctx, n: int = 20):
         mark = medals[rank - 1] + " " if rank <= 3 else f"`{rank}.` "
         lines.append(f"{mark}**{i['name']}** — 淨收入 `{fmt(i['low'] * 0.935)}` · "
                      f"在售 `{fmt(i.get('count', 0))}` · {sell_grade(i)}{adv}")
-    emb = discord.Embed(title=f"📦 雜物賣出推薦 Top{n}", description="\n".join(lines), color=0xf0b429)
-    emb.set_footer(text=f"資料更新於 {snap.get('generated', '')}")
-    await ctx.send(embed=emb)
+    os.makedirs(CHART_DIR, exist_ok=True)
+    try:
+        path = top_table_png(pool[:n], os.path.join(CHART_DIR, f"top_misc_{'all' if rarity is None else int(rarity)}.png"),
+                             title=f"{label}賣出推薦 Top{n}")
+        await ctx.send(f"📦 **{label}賣出推薦 Top{n}**（資料更新於 {snap.get('generated', '')}）",
+                       file=discord.File(path))
+    except Exception as e:
+        print("top chart fail:", e)
+        emb = discord.Embed(title=f"📦 {label}賣出推薦 Top{n}", description="\n".join(lines), color=color)
+        emb.set_footer(text=f"資料更新於 {snap.get('generated', '')}")
+        await ctx.send(embed=emb)
+
+
+@bot.command(name="top")
+async def top_cmd(ctx, n: int = 20):
+    await _top_misc(ctx, None, "", 0xf0b429, n)
+
+
+@bot.command(name="topg")
+async def topg_cmd(ctx, n: int = 20):
+    await _top_misc(ctx, 5.0, "金", 0xf0b429, n)
+
+
+@bot.command(name="topp")
+async def topp_cmd(ctx, n: int = 20):
+    await _top_misc(ctx, 4.0, "紫", 0x9b59b6, n)
+
+
+@bot.command(name="topb")
+async def topb_cmd(ctx, n: int = 20):
+    await _top_misc(ctx, 3.0, "藍", 0x4d9fff, n)
 
 
 @bot.command(name="price")
@@ -481,7 +566,7 @@ async def stopalert(ctx):
 @bot.command(name="help")
 async def help_cmd(ctx):
     await ctx.send("```\n!keys    電視台鑰匙補貨推薦\n!chart30 30天每日區間圖\n!chart100 近100天週區間圖\n"
-                   "!sell [關鍵字]  賣出推薦 Top15\n!top [數量]  雜物賣出推薦 Top20\n!price 物品關鍵字  單品評估卡+圖表\n"
+                   "!sell [關鍵字]  賣出推薦 Top15\n!top [數量] 雜物 Top20\n!topg [數量] 金色雜物 Top20\n!topp [數量] 紫色雜物 Top20\n!topb [數量] 藍色雜物 Top20\n!price 物品關鍵字  單品評估卡+圖表\n"
                    "!setalert #頻道  設定訊號警示\n!stopalert  停止警示\n```")
 
 
