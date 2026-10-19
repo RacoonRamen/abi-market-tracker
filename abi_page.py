@@ -16,7 +16,8 @@ import os
 import re
 import webbrowser
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+TAIPEI = timezone(timedelta(hours=8))
 
 TEMPLATE = """<!DOCTYPE html>
 <html lang="zh-Hant">
@@ -321,7 +322,7 @@ setAuto(+autoRef.value);
 autoRef.addEventListener('input', () => setAuto(+autoRef.value));
 
 // 資料年齡顯示
-const genDate = new Date(DATA.generated.replace(' ', 'T').replace(' UTC', 'Z'));
+const genDate = new Date(DATA.generated.replace(' ', 'T').replace(' UTC', 'Z').replace(' 台北', '+08:00'));
 function tickAge(){
   const age = Math.max(0, Math.round((Date.now() - genDate.getTime()) / 60000));
   document.getElementById('meta').textContent = `資料更新於 ${DATA.generated} (${age} 分鐘前)`;
@@ -844,7 +845,7 @@ def main():
 
     cats = [{"minor": m, "name": cat_zh.get(m, name), "major": MINOR_TO_MAJOR.get(m, "?"), "n": n}
             for (m, name), n in cats_n.items()]
-    payload = {"generated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    payload = {"generated": datetime.now(TAIPEI).strftime("%Y-%m-%d %H:%M 台北"),
                "majors": MAJORS, "cats": cats, "items": items,
                "tv_unlisted": tv_unlisted}
 

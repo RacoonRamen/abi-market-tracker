@@ -8,7 +8,8 @@ import argparse
 import csv
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+TAIPEI = timezone(timedelta(hours=8))
 
 PAGE = """<!DOCTYPE html>
 <html lang="zh-Hant">
@@ -290,7 +291,7 @@ def main():
     summary = """<table class="summary"><tr><th>鑰匙</th><th>現價</th><th>買入線</th><th>賣出目標</th><th>日成交量</th><th>日成交額</th><th>在售</th></tr>
 """ + "\n".join(rows) + "</table>"
 
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now = datetime.now(TAIPEI).strftime("%Y-%m-%d %H:%M 台北")
     html = PAGE.replace("__SUMMARY__", summary).replace("__CARDS__", "\n".join(cards)) \
                .replace("__UNLISTED__", "、".join(unlisted)).replace("__GENERATED__", now)
     with open(args.out, "w", encoding="utf-8") as f:
