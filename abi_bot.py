@@ -562,6 +562,38 @@ def rarity_of(item_id):
     return RARITY_MAP.get(str(item_id))
 
 
+def forecast_png(fc_items, out_path):
+    """預估圖: 每把鑰匙一行 = 明日通道(金帶) + 現價(綠點), 現價偏離中心 % 排序"""
+    plt = _plt()
+    rows = sorted(fc_items, key=lambda e: e["current"] / max(1, e["d1"]["center"]))
+    n = len(rows)
+    fig, ax = plt.subplots(figsize=(10.5, 0.42 * n + 1.2), facecolor=BG)
+    ax.set_facecolor(PANEL)
+    for k, e in enumerate(rows):
+        d1 = e["d1"]
+        lo, hi, c = d1["lo"] / 10000, d1["hi"] / 10000, d1["center"] / 10000
+        cur = e["current"] / 10000
+        ax.plot([lo, hi], [k, k], color=GOLD, lw=7, alpha=0.35, solid_capstyle="round")
+        ax.plot(c, k, "o", color=GOLD, ms=4)
+        inb = lo <= cur <= hi
+        ax.plot(cur, k, "o", color=GREEN if inb else RED, ms=6)
+        ax.text(max(cur, hi) + (hi - lo) * 0.06 + 0.5, k,
+                f"{(cur / c - 1) * 100:+.1f}%", va="center",
+                color=GREEN if inb else RED, fontsize=8)
+    ax.set_yticks(range(n))
+    ax.set_yticklabels([e["name"][:11] for e in rows], color="#e6e9f0", fontsize=9)
+    ax.set_xlabel("價格 (萬)", color=DIM, fontsize=9)
+    ax.tick_params(colors=DIM, labelsize=8)
+    for sp in ax.spines.values():
+        sp.set_color(LINE)
+    ax.set_title("🔮 明日最低價預估通道 — 金帶=預估區間, 點=現價 (綠=通道內, 紅=偏離), %=偏差",
+                 color=GOLD, fontsize=11, pad=10)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130, facecolor=BG)
+    plt.close(fig)
+    return out_path
+
+
 async def _top_misc(ctx, rarity, kind, color, n=20):
     """雜物指定稀有度 TopN (rarity=None 全部), 例: !topg 10"""
     n = max(1, min(n, 25))
@@ -676,25 +708,28 @@ async def price_cmd(ctx, *, query=""):
         await ctx.send(embed=emb, files=files)
 
 
-@bot.command(name="forecast", brief="明日價格預估通道",
-             description="均值回歸通道模型：用 30 天每日低點預估明日/3日/7日最低價區間，並標出現價落在通道哪裡。\n例: !forecast")
+@bot.command(name="forecast", brief="明日價格預估通道（圖）",
+             description="均值回歸通道模型：用 30 天每日低點預估明日最低價區間。\n圖片：金帶=預估區間, 綠點=通道內現價, 紅點=偏離, %=偏差, 由最接近進場點排起。\n例: !forecast")
 async def forecast_cmd(ctx):
     fc = load_json(os.path.join(HERE, "forecast.json"), {}) or {}
-    items = fc.get("items", {})
+    items = [e for e in fc.get("items", {}).values()
+             if e.get("d1") and "鑰匙" in str(e.get("name", ""))]
     if not items:
         await ctx.send("還沒有預估資料 (forecast.json 缺失)"); return
     snap = bot.snapshot()
-    rows = [["物品", "現價", "明日區間", "偏差", "位置"]]
-    # 只看鑰匙, 依偏差由小到大（最接近進場點排前面）
-    tv = [(e["name"], e) for iid, e in items.items() if str(iid).startswith("40505") and e.get("d1")]
-    tv.sort(key=lambda kv: kv[1]["current"] / max(1, kv[1]["d1"]["center"]))
-    for name, e in tv[:12]:
-        d1 = e["d1"]
-        gap = (e["current"] / d1["center"] - 1) * 100
-        pos = {"below-band": "⭐已破下緣", "low-band": "💰下緣區"}.get(e["signal"], "—通道內")
-        rows.append([name[:10], fmt(e["current"]), f"{fmt(d1['lo'])}~{fmt(d1['hi'])}", f"{gap:+.1f}%", pos])
-    await ctx.send("🔮 **明日最低價預估**（均值回歸通道）\n```\n" + table(rows)[:1800] + "\n```\n"
-                   + dstamp(snap) + " · 預估產生 " + fc.get("generated", ""))
+    os.makedirs(CHART_DIR, exist_ok=True)
+    try:
+        path = forecast_png(items, os.path.join(CHART_DIR, "forecast.png"))
+        await ctx.send("🔮 **明日最低價預估**（均值回歸通道, 由最接近進場點排起）\n" + dstamp(snap),
+                       file=discord.File(path))
+    except Exception as e:
+        print("forecast chart fail:", e)
+        rows = [["物品", "現價", "明日區間", "偏差"]]
+        for e in sorted(items, key=lambda x: x["current"] / max(1, x["d1"]["center"]))[:12]:
+            d1 = e["d1"]
+            gap = (e["current"] / d1["center"] - 1) * 100
+            rows.append([e["name"][:10], fmt(e["current"]), f"{fmt(d1['lo'])}~{fmt(d1['hi'])}", f"{gap:+.1f}%"])
+        await ctx.send("🔮 **明日最低價預估**\n```\n" + table(rows)[:1800] + "\n```\n" + dstamp(snap))
 
 
 @bot.command(brief="設定鑰匙訊號推播頻道",
