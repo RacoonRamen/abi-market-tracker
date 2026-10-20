@@ -18,3 +18,9 @@ full_scan*.log
 # Python
 __pycache__/
 *.pyc
+
+# chart cache / demo images
+charts/
+tv_chart*.png
+tv_item_demo.png
+tv_overview*.png
