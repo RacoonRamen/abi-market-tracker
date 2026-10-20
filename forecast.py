@@ -48,7 +48,24 @@ def lin_slope(vals):
     return num / den if den else 0.0
 
 
-def forecast_item(day_rows, horizon=(1, 3, 7)):
+def parse_week_rows(rows):
+    """history.json week -> [(start_date, low, high)] 舊在前 (每列是一週區間)"""
+    out = []
+    for r in rows:
+        try:
+            lo, hi = (int(x.strip().replace(",", "")) for x in r[1].split("~"))
+        except Exception:
+            try:
+                lo = hi = int(r[1].replace(",", ""))
+            except Exception:
+                continue
+        start = r[0].split("~")[0].split(" ")[0]
+        out.append((start, lo, hi))
+    out.reverse()
+    return out
+
+
+def forecast_item(day_rows, horizon=(1, 3, 7), slope_win=14):
     """回 {h: (center, lo, hi)} 與模型狀態"""
     if len(day_rows) < 10:
         return None
@@ -56,10 +73,10 @@ def forecast_item(day_rows, horizon=(1, 3, 7)):
     n = len(lows)
     mean = sum(lows) / n
     std = math.sqrt(sum((v - mean) ** 2 for v in lows) / max(1, n - 1))
-    # 近 14 天斜率, 折半取保守
-    slope = lin_slope(lows[-14:]) * 0.5
-    # 斜率顯著性: |slope|*14 < 0.3*std 視為漂移不足, 歸零
-    if abs(slope) * 14 < 0.3 * std:
+    win = min(slope_win, n)
+    # 斜率折半取保守, 顯著性不足歸零
+    slope = lin_slope(lows[-win:]) * 0.5
+    if abs(slope) * win < 0.3 * std:
         slope = 0.0
     out = {}
     for h in horizon:
@@ -107,9 +124,13 @@ def main():
     now = datetime.now(TAIPEI)
     tgt = now + timedelta(days=1)
     wd = "一二三四五六日"[tgt.weekday()]
+    wtgt = now + timedelta(days=7)
+    wwd = "一二三四五六日"[wtgt.weekday()]
     out = {"generated": now.strftime("%Y-%m-%d %H:%M 台北"),
            "target_date": tgt.strftime("%Y-%m-%d"),
            "target_label": f"{tgt.month}/{tgt.day}（週{wd}）",
+           "week_target_date": wtgt.strftime("%Y-%m-%d"),
+           "week_target_label": f"{wtgt.month}/{wtgt.day}（週{wwd}）",
            "method": "mean-reversion channel + half-slope drift", "items": {}}
     for iid, h in raw.items():
         rows = parse_day_rows(h.get("day", []))
@@ -124,6 +145,13 @@ def main():
         for hd in m["f"]:
             c, lo, hi = m["f"][hd]
             entry[f"d{hd}"] = {"center": int(c), "lo": int(lo), "hi": int(hi)}
+        # 100 天週模型: 用週最低價推下週
+        wrows = parse_week_rows(h.get("week", []))
+        wm = forecast_item(wrows, horizon=(1,), slope_win=8) if len(wrows) >= 6 else None
+        if wm:
+            c, lo, hi = wm["f"][1]
+            entry["w1"] = {"center": int(c), "lo": int(lo), "hi": int(hi)}
+            entry["w_from"], entry["w_to"], entry["w_n"] = wrows[0][0], wrows[-1][0], len(wrows)
         # 判讀: 現價已在預估 d1 區間下緣以下 → 已進場區
         entry["signal"] = ("below-band" if cur.get(iid) and cur[iid] < entry["d1"]["lo"]
                            else ("low-band" if cur.get(iid) and cur[iid] < entry["d1"]["center"]

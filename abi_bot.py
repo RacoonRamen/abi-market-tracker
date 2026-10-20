@@ -562,17 +562,15 @@ def rarity_of(item_id):
     return RARITY_MAP.get(str(item_id))
 
 
-def forecast_png(fc_items, out_path):
-    """預估圖: 每把鑰匙一行 = 明日通道(金帶) + 現價(綠點), 現價偏離中心 % 排序"""
+def forecast_png(rows, out_path, title):
+    """預估圖: rows=[(name, current, lo, hi, center)]; 金帶=預估區間, 綠/紅點=現價"""
     plt = _plt()
-    rows = sorted(fc_items, key=lambda e: e["current"] / max(1, e["d1"]["center"]))
+    rows = sorted(rows, key=lambda r: r[1] / max(1, r[4]))
     n = len(rows)
     fig, ax = plt.subplots(figsize=(10.5, 0.42 * n + 1.2), facecolor=BG)
     ax.set_facecolor(PANEL)
-    for k, e in enumerate(rows):
-        d1 = e["d1"]
-        lo, hi, c = d1["lo"] / 10000, d1["hi"] / 10000, d1["center"] / 10000
-        cur = e["current"] / 10000
+    for k, (name, cur, lo, hi, c) in enumerate(rows):
+        lo, hi, c, cur = lo / 10000, hi / 10000, c / 10000, cur / 10000
         ax.plot([lo, hi], [k, k], color=GOLD, lw=7, alpha=0.35, solid_capstyle="round")
         ax.plot(c, k, "o", color=GOLD, ms=4)
         inb = lo <= cur <= hi
@@ -581,13 +579,13 @@ def forecast_png(fc_items, out_path):
                 f"{(cur / c - 1) * 100:+.1f}%", va="center",
                 color=GREEN if inb else RED, fontsize=8)
     ax.set_yticks(range(n))
-    ax.set_yticklabels([e["name"][:11] for e in rows], color="#e6e9f0", fontsize=9)
+    ax.set_yticklabels([r[0][:11] for r in rows], color="#e6e9f0", fontsize=9)
+    ax.invert_yaxis()  # 最接近進場點的排最上面
     ax.set_xlabel("價格 (萬)", color=DIM, fontsize=9)
     ax.tick_params(colors=DIM, labelsize=8)
     for sp in ax.spines.values():
         sp.set_color(LINE)
-    ax.set_title("🔮 明日最低價預估通道 — 金帶=預估區間, 點=現價 (綠=通道內, 紅=偏離), %=偏差",
-                 color=GOLD, fontsize=11, pad=10)
+    ax.set_title(title, color=GOLD, fontsize=11, pad=10)
     fig.tight_layout()
     fig.savefig(out_path, dpi=130, facecolor=BG)
     plt.close(fig)
@@ -708,47 +706,77 @@ async def price_cmd(ctx, *, query=""):
         await ctx.send(embed=emb, files=files)
 
 
-def forecast_text(fc):
-    """把 forecast.json 轉成白話訊息"""
+def forecast_rows(fc, band):
+    """band='d1' 用 30 天日線 (明日), band='w1' 用 100 天週線 (下週)"""
     items = [e for e in fc.get("items", {}).values()
-             if e.get("d1") and "鑰匙" in str(e.get("name", ""))]
-    if not items:
-        return None
-    tgt = fc.get("target_label", "明天")
-    items.sort(key=lambda e: e["current"] / max(1, e["d1"]["center"]))
-    lines = [f"🔮 **{tgt} 電視台鑰匙最低價預估**", ""]
-    for e in items:
-        d1 = e["d1"]
-        chg = (d1["center"] / e["current"] - 1) * 100
+             if e.get(band) and "鑰匙" in str(e.get("name", ""))]
+    return sorted(items, key=lambda e: e["current"] / max(1, e[band]["center"]))
+
+
+def forecast_caption(fc, items, band, period_label):
+    """圖片用的白話說明"""
+    tgt = fc.get("target_label" if band == "d1" else "week_target_label", "")
+    lines = [f"🔮 **{tgt} 電視台鑰匙{period_label}預估**"]
+    for e in items[:5]:
+        b = e[band]
+        chg = (b["center"] / e["current"] - 1) * 100
         arrow = "⬇️" if chg < 0 else ("⬆️" if chg > 1 else "➡️")
         tail = ""
-        if e["current"] <= d1["lo"]:
-            tail = "　⭐現在已比預估低，可以進"
-        elif e["current"] <= d1["center"]:
-            tail = "　💰已在預估區下半"
+        if e["current"] <= b["lo"]:
+            tail = "　⭐現價已低於預估，可以進"
         elif chg < -10:
             tail = "　⏳等跌"
-        lines.append(
-            f"{arrow} **{e['name']}**\n"
-            f"　預估 **{fmt(d1['lo'])} ~ {fmt(d1['hi'])}**（中心 {fmt(d1['center'])}）\n"
-            f"　現價 {fmt(e['current'])} → 明日中心 {fmt(d1['center'])}，比現價 **{chg:+.1f}%**{tail}")
-    lo_date = min(e.get("data_from", "") for e in items)
-    hi_date = max(e.get("data_to", "") for e in items)
-    days = max(e.get("days", 0) for e in items)
-    footer = (f"\n-# 依據 {lo_date} ~ {hi_date}（{days} 天每日最低價）· "
-              f"預估於 {fc.get('generated', '')}")
-    body = "\n".join(lines)
-    return (body[:1700] + "\n…" if len(body) > 1700 else body) + footer
+        lines.append(f"{arrow} **{e['name']}**：預估 {fmt(b['lo'])}~{fmt(b['hi'])}"
+                     f"（中心 {fmt(b['center'])}），比現價 {chg:+.1f}%{tail}")
+    if band == "d1":
+        f, t, n = (min(e.get("data_from", "") for e in items),
+                   max(e.get("data_to", "") for e in items),
+                   max(e.get("days", 0) for e in items))
+        basis = f"{f} ~ {t}（{n} 天每日最低價）"
+    else:
+        f, t, n = (min(e.get("w_from", "") for e in items),
+                   max(e.get("w_to", "") for e in items),
+                   max(e.get("w_n", 0) for e in items))
+        basis = f"{f} ~ {t}（{n} 週每週最低價）"
+    lines.append(f"-# 依據 {basis} · 預估於 {fc.get('generated', '')}"
+                 f" · 金帶=預估區間, 綠點=通道內, 紅點=偏離")
+    return "\n".join(lines)
 
 
-@bot.command(name="forecast", brief="明日最低價預估（白話）",
-             description="用近 30 天每日最低價推估「明天」的價格區間，白話列出預估價、比現價漲跌幾 %、用了哪段期間的資料。\n例: !forecast")
-async def forecast_cmd(ctx):
+async def _send_forecast(ctx, band, period_label, fname):
     fc = load_json(os.path.join(HERE, "forecast.json"), {}) or {}
-    text = forecast_text(fc)
-    if not text:
-        await ctx.send("還沒有預估資料 (forecast.json 缺失)"); return
-    await ctx.send(text)
+    items = forecast_rows(fc, band)
+    if not items:
+        await ctx.send("還沒有預估資料 (forecast.json 缺失或該模型資料不足)"); return
+    caption = forecast_caption(fc, items, band, period_label)
+    chart_rows = [(e["name"], e["current"], e[band]["lo"], e[band]["hi"], e[band]["center"])
+                  for e in items]
+    os.makedirs(CHART_DIR, exist_ok=True)
+    try:
+        path = forecast_png(chart_rows, os.path.join(CHART_DIR, fname),
+                            f"{period_label}最低價預估 — 金帶=預估區間, 綠點=通道內, 紅點=偏離, %=現價偏差")
+        await ctx.send(caption, file=discord.File(path))
+    except Exception as e:
+        print("forecast chart fail:", e)
+        await ctx.send(caption)
+
+
+@bot.command(name="forecast", brief="明日最低價預估（圖）",
+             description="用近 30 天每日最低價推估「明天」的價格區間（圖片＋白話摘要）。\n例: !forecast")
+async def forecast_cmd(ctx):
+    await _send_forecast(ctx, "d1", "明日", "forecast_30.png")
+
+
+@bot.command(name="forecast30", brief="明日最低價預估（30天日線）",
+             description="用近 30 天每日最低價推估明天的最低價區間，附圖表與白話摘要。\n例: !forecast30")
+async def forecast30_cmd(ctx):
+    await _send_forecast(ctx, "d1", "明日", "forecast_30.png")
+
+
+@bot.command(name="forecast100", brief="下週最低價預估（100天週線）",
+             description="用近 100 天每週最低價推估下週的最低價區間，樣本長、波動估得較寬。\n例: !forecast100")
+async def forecast100_cmd(ctx):
+    await _send_forecast(ctx, "w1", "下週", "forecast_100.png")
 
 
 @bot.command(brief="設定鑰匙訊號推播頻道",
