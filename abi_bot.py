@@ -9,11 +9,15 @@
   !setalert #頻道      設定鑰匙訊號警示 (Components V2 卡片推播)
   !stopalert / !ping / !help
 """
+import asyncio
 import json
 import math
 import os
+import subprocess
 import sys
+import time
 import unicodedata
+import urllib.request
 
 import discord
 from discord.ext import commands, tasks
@@ -269,6 +273,72 @@ def top_table_png(items, out_path, title=None):
     return out_path
 
 
+GH_REPO = "RacoonRamen/abi-market-tracker"
+GH_WORKFLOW = "scrape-tv-keys.yml"
+_last_dispatch = 0.0
+
+
+def _gh_token():
+    try:
+        t = open(os.path.expanduser("~/.github-pat"), encoding="utf-8").read().strip()
+        return t or None
+    except Exception:
+        return None
+
+
+def _dispatch(minor):
+    """觸發 GitHub 指定分類抓取（同步函式，呼叫方用 to_thread）"""
+    tok = _gh_token()
+    if not tok:
+        return "no-pat"
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{GH_WORKFLOW}/dispatches",
+            data=json.dumps({"ref": "main", "inputs": {"minor": minor}}).encode(),
+            headers={"Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {tok}"})
+        urllib.request.urlopen(req, timeout=15)
+        return "ok"
+    except Exception as e:
+        print("dispatch fail:", e)
+        return "fail"
+
+
+def _pull():
+    try:
+        subprocess.run(["git", "-C", HERE, "pull", "--ff-only", "-q"], timeout=60)
+    except Exception as e:
+        print("pull fail:", e)
+
+
+async def _ensure_fresh(ctx, minor, label, timeout=420):
+    """按需抓取：dispatch 指定分類→等 snapshot.json 更新。
+    成功回 True；拿不到（含3分鐘內剛按過）就用舊資料回 False。"""
+    global _last_dispatch
+    try:
+        old_mtime = os.path.getmtime(SNAPSHOT)
+    except OSError:
+        old_mtime = 0
+    now = time.monotonic()
+    if now - _last_dispatch >= 180:
+        st = await asyncio.to_thread(_dispatch, minor)
+        if st == "no-pat":
+            await ctx.send("⏳ 主機還沒放 PAT（`~/.github-pat`），先用舊資料"); return False
+        if st != "ok":
+            await ctx.send("⏳ 觸發失敗，先用舊資料"); return False
+        _last_dispatch = now
+        await ctx.send(f"🔄 正在重抓{label}（約 1~3 分鐘）…")
+    for _ in range(max(1, timeout // 20)):
+        await asyncio.sleep(20)
+        await asyncio.to_thread(_pull)
+        try:
+            if os.path.getmtime(SNAPSHOT) != old_mtime:
+                return True
+        except OSError:
+            pass
+    await ctx.send("⏳ 抓取超時先用舊資料"); return False
+
+
 # ==================== Bot ====================
 class AbiBot(commands.Bot):
     def __init__(self):
@@ -360,6 +430,7 @@ async def ping(ctx):
 
 @bot.command(name="keys")
 async def keys_cmd(ctx):
+    await _ensure_fresh(ctx, TV_MINOR, "電視台鑰匙")
     pool = bot.tv_items()
     rows = [["鑰匙", "現價", "補貨價", "深跌價", "距補貨", "狀態"]]
     for i in pool:
@@ -388,6 +459,7 @@ async def chart_cmd(ctx):
 
 async def _send_bands(ctx, mode):
     await ctx.typing()
+    await _ensure_fresh(ctx, TV_MINOR, "電視台鑰匙")
     os.makedirs(CHART_DIR, exist_ok=True)
     pool = bot.tv_items()
     if not pool:
@@ -512,6 +584,12 @@ async def topb_cmd(ctx, n: int = 20):
     await _top_misc(ctx, 3.0, "藍", 0x4d9fff, n)
 
 
+@bot.command(name="refresh")
+async def refresh_cmd(ctx):
+    """手動整套重抓（約 3~4 分鐘），例: !refresh"""
+    await _ensure_fresh(ctx, "", "全站資料", timeout=600)
+
+
 @bot.command(name="price")
 async def price_cmd(ctx, *, query=""):
     query = query.strip().lower()
@@ -523,6 +601,15 @@ async def price_cmd(ctx, *, query=""):
     pool.sort(key=lambda i: -i["low"])
     if not pool:
         await ctx.send("找不到符合的物品"); return
+    minor = str(pool[0].get("minor", ""))
+    if minor:
+        await _ensure_fresh(ctx, minor, pool[0]["name"])
+        snap = bot.snapshot()
+        pool = [i for i in snap.get("items", [])
+                if query in i["name"].lower() or query in i.get("name_en", "").lower()]
+        pool.sort(key=lambda i: -i["low"])
+        if not pool:
+            await ctx.send("找不到符合的物品"); return
     os.makedirs(CHART_DIR, exist_ok=True)
     hist = load_json(HISTORY, {})
     for i in pool[:3]:
@@ -566,7 +653,7 @@ async def stopalert(ctx):
 @bot.command(name="help")
 async def help_cmd(ctx):
     await ctx.send("```\n!keys    電視台鑰匙補貨推薦\n!chart30 30天每日區間圖\n!chart100 近100天週區間圖\n"
-                   "!sell [關鍵字]  賣出推薦 Top15\n!top [數量] 雜物 Top20\n!topg [數量] 金色雜物 Top20\n!topp [數量] 紫色雜物 Top20\n!topb [數量] 藍色雜物 Top20\n!price 物品關鍵字  單品評估卡+圖表\n"
+                   "!sell [關鍵字]  賣出推薦 Top15\n!top [數量] 雜物 Top20\n!topg [數量] 金色雜物 Top20\n!topp [數量] 紫色雜物 Top20\n!topb [數量] 藍色雜物 Top20\n!price 物品關鍵字  單品評估卡+圖表\n!refresh  手動整套重抓\n"
                    "!setalert #頻道  設定訊號警示\n!stopalert  停止警示\n```")
 
 

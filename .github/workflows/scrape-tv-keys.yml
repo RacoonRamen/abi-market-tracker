@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "*/5 * * * *"  # GitHub 最短 5 分鐘
   workflow_dispatch:
+    inputs:
+      minor:
+        description: "指定小分類 ID（只抓它，例 40505；留空=全套）"
+        required: false
+        default: ""
 
 concurrency:
   group: scrape
@@ -26,7 +31,16 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m playwright install --with-deps chromium
 
-      - name: scrape tv keys + history
+      - name: scrape targeted minor
+        if: inputs.minor != ''
+        run: |
+          python abi_tracker.py --minor ${{ inputs.minor }} --once --csv tv_keys.csv
+          python abi_history.py --minor ${{ inputs.minor }} --out history.json
+          python abi_page.py --csv prices_all_full.csv --hist tv_keys.csv --history history.json --json snapshot.json
+          python abi_tv.py
+
+      - name: scrape full
+        if: inputs.minor == ''
         run: |
           python abi_tracker.py --minor 40505 --once --csv tv_keys.csv
           python abi_history.py --minor 40505 --out history.json
@@ -40,7 +54,11 @@ jobs:
           git config user.email "abi-scraper@users.noreply.github.com"
           git add tv_keys.csv history.json history_state.json snapshot.json dashboard.html tv_keys.html
           if ! git diff --cached --quiet; then
-            git commit -m "auto scrape $(date -u +%FT%TZ)"
+            if [ -n "${{ inputs.minor }}" ]; then
+              git commit -m "refresh ${{ inputs.minor }} $(date -u +%FT%TZ)"
+            else
+              git commit -m "auto scrape $(date -u +%FT%TZ)"
+            fi
             git pull --rebase
             git push
           else
