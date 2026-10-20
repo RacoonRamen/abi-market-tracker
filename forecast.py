@@ -32,6 +32,7 @@ def parse_day_rows(rows):
             except Exception:
                 continue
         out.append((r[0].split(" ")[0], lo, hi))
+    out.reverse()  # history.json 是「新→舊」, 轉成時間正序
     return out
 
 
@@ -103,18 +104,23 @@ def main():
     except Exception:
         pass
 
-    out = {"generated": datetime.now(TAIPEI).strftime("%Y-%m-%d %H:%M 台北"),
+    now = datetime.now(TAIPEI)
+    tgt = now + timedelta(days=1)
+    wd = "一二三四五六日"[tgt.weekday()]
+    out = {"generated": now.strftime("%Y-%m-%d %H:%M 台北"),
+           "target_date": tgt.strftime("%Y-%m-%d"),
+           "target_label": f"{tgt.month}/{tgt.day}（週{wd}）",
            "method": "mean-reversion channel + half-slope drift", "items": {}}
     for iid, h in raw.items():
         rows = parse_day_rows(h.get("day", []))
         m = forecast_item(rows)
         if not m:
             continue
-        f1 = m["f"][1]
         entry = {"name": names.get(iid, iid),
                  "current": cur.get(iid) or m["last"],
                  "mean": int(m["mean"]), "std": int(m["std"]),
-                 "drift": int(m["slope"])}
+                 "drift": int(m["slope"]),
+                 "data_from": rows[0][0], "data_to": rows[-1][0], "days": len(rows)}
         for hd in m["f"]:
             c, lo, hi = m["f"][hd]
             entry[f"d{hd}"] = {"center": int(c), "lo": int(lo), "hi": int(hi)}

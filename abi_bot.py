@@ -708,28 +708,47 @@ async def price_cmd(ctx, *, query=""):
         await ctx.send(embed=emb, files=files)
 
 
-@bot.command(name="forecast", brief="明日價格預估通道（圖）",
-             description="均值回歸通道模型：用 30 天每日低點預估明日最低價區間。\n圖片：金帶=預估區間, 綠點=通道內現價, 紅點=偏離, %=偏差, 由最接近進場點排起。\n例: !forecast")
-async def forecast_cmd(ctx):
-    fc = load_json(os.path.join(HERE, "forecast.json"), {}) or {}
+def forecast_text(fc):
+    """把 forecast.json 轉成白話訊息"""
     items = [e for e in fc.get("items", {}).values()
              if e.get("d1") and "鑰匙" in str(e.get("name", ""))]
     if not items:
+        return None
+    tgt = fc.get("target_label", "明天")
+    items.sort(key=lambda e: e["current"] / max(1, e["d1"]["center"]))
+    lines = [f"🔮 **{tgt} 電視台鑰匙最低價預估**", ""]
+    for e in items:
+        d1 = e["d1"]
+        chg = (d1["center"] / e["current"] - 1) * 100
+        arrow = "⬇️" if chg < 0 else ("⬆️" if chg > 1 else "➡️")
+        tail = ""
+        if e["current"] <= d1["lo"]:
+            tail = "　⭐現在已比預估低，可以進"
+        elif e["current"] <= d1["center"]:
+            tail = "　💰已在預估區下半"
+        elif chg < -10:
+            tail = "　⏳等跌"
+        lines.append(
+            f"{arrow} **{e['name']}**\n"
+            f"　預估 **{fmt(d1['lo'])} ~ {fmt(d1['hi'])}**（中心 {fmt(d1['center'])}）\n"
+            f"　現價 {fmt(e['current'])} → 明日中心 {fmt(d1['center'])}，比現價 **{chg:+.1f}%**{tail}")
+    lo_date = min(e.get("data_from", "") for e in items)
+    hi_date = max(e.get("data_to", "") for e in items)
+    days = max(e.get("days", 0) for e in items)
+    footer = (f"\n-# 依據 {lo_date} ~ {hi_date}（{days} 天每日最低價）· "
+              f"預估於 {fc.get('generated', '')}")
+    body = "\n".join(lines)
+    return (body[:1700] + "\n…" if len(body) > 1700 else body) + footer
+
+
+@bot.command(name="forecast", brief="明日最低價預估（白話）",
+             description="用近 30 天每日最低價推估「明天」的價格區間，白話列出預估價、比現價漲跌幾 %、用了哪段期間的資料。\n例: !forecast")
+async def forecast_cmd(ctx):
+    fc = load_json(os.path.join(HERE, "forecast.json"), {}) or {}
+    text = forecast_text(fc)
+    if not text:
         await ctx.send("還沒有預估資料 (forecast.json 缺失)"); return
-    snap = bot.snapshot()
-    os.makedirs(CHART_DIR, exist_ok=True)
-    try:
-        path = forecast_png(items, os.path.join(CHART_DIR, "forecast.png"))
-        await ctx.send("🔮 **明日最低價預估**（均值回歸通道, 由最接近進場點排起）\n" + dstamp(snap),
-                       file=discord.File(path))
-    except Exception as e:
-        print("forecast chart fail:", e)
-        rows = [["物品", "現價", "明日區間", "偏差"]]
-        for e in sorted(items, key=lambda x: x["current"] / max(1, x["d1"]["center"]))[:12]:
-            d1 = e["d1"]
-            gap = (e["current"] / d1["center"] - 1) * 100
-            rows.append([e["name"][:10], fmt(e["current"]), f"{fmt(d1['lo'])}~{fmt(d1['hi'])}", f"{gap:+.1f}%"])
-        await ctx.send("🔮 **明日最低價預估**\n```\n" + table(rows)[:1800] + "\n```\n" + dstamp(snap))
+    await ctx.send(text)
 
 
 @bot.command(brief="設定鑰匙訊號推播頻道",
