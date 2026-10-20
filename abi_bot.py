@@ -168,27 +168,30 @@ def tv_overview_png(snap_items, out_path, mode="day30"):
         buy_p = it.get("buy_price") or 0
         if buy_p:
             ax.axhline(buy_p, color=GOLD, ls=":", lw=1.8)
-        # 右側標籤: 現價 (綠) 與補貨價 (金), 避開彼此
+        # 右側標籤: 現價 (綠) 與補貨價 (金), 避開彼此 + 差額/差%
         import matplotlib.transforms as mtransforms
         trans = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
         yr = ax.get_ylim()
         off = (yr[1] - yr[0]) * 0.025
+        gap = cur - buy_p if buy_p else 0
+        gap_pct = (cur / buy_p - 1) * 100 if buy_p else 0
         cur_hi = cur >= buy_p
         if cur_hi:
             ax.text(0.99, cur + off, f"現價 {cur:,}", transform=trans, ha="right",
                     va="bottom", color=GREEN, fontsize=7,
                     bbox=dict(facecolor=BG, alpha=0.55, pad=0.6, edgecolor="none"))
             if buy_p:
-                ax.text(0.99, buy_p - off, f"補貨價 {buy_p:,}", transform=trans, ha="right",
-                        va="top", color=GOLD, fontsize=7,
+                ax.text(0.99, buy_p - off, f"進貨價 {buy_p:,} (貴 {gap:,} / {gap_pct:+.1f}%)",
+                        transform=trans, ha="right", va="top", color=GOLD, fontsize=7,
                         bbox=dict(facecolor=BG, alpha=0.55, pad=0.6, edgecolor="none"))
         else:
             ax.text(0.99, cur - off, f"現價 {cur:,}", transform=trans, ha="right",
                     va="top", color=GREEN, fontsize=7,
                     bbox=dict(facecolor=BG, alpha=0.55, pad=0.6, edgecolor="none"))
-            ax.text(0.99, buy_p + off, f"補貨價 {buy_p:,}", transform=trans, ha="right",
-                    va="bottom", color=GOLD, fontsize=7,
-                    bbox=dict(facecolor=BG, alpha=0.55, pad=0.6, edgecolor="none"))
+            if buy_p:
+                ax.text(0.99, buy_p + off, f"進貨價 {buy_p:,} (低 {abs(gap):,} / {gap_pct:+.1f}% → 可進)",
+                        transform=trans, ha="right", va="bottom", color=GOLD, fontsize=7,
+                        bbox=dict(facecolor=BG, alpha=0.55, pad=0.6, edgecolor="none"))
         name = it["name"]
         short = name[:9] + "…" if len(name) > 10 else name
         mark = {"deep": "💰💰", "buy": "💰", "sell": "⬆", "wait": ""}.get(sig_of(it), "")
@@ -428,12 +431,13 @@ async def on_ready():
     print(f"已登入: {bot.user}")
 
 
-@bot.command()
+@bot.command(brief="存活檢查", description="回 pong，確認 bot 還活著。\n例: !ping")
 async def ping(ctx):
     await ctx.send("pong 🏓")
 
 
-@bot.command(name="keys")
+@bot.command(name="keys", brief="電視台鑰匙補貨推薦表",
+              description="列出 18 把鑰匙的現價、補貨價（P25）、深跌價（歷史地板×1.03）與距補貨 %。\n會先自動重抓鑰匙分類（約 1~3 分鐘）。\n例: !keys")
 async def keys_cmd(ctx):
     await _ensure_fresh(ctx, TV_MINOR, "電視台鑰匙")
     snap = bot.snapshot()
@@ -448,17 +452,20 @@ async def keys_cmd(ctx):
     await ctx.send("🔑 **電視台鑰匙補貨推薦**\n```\n" + table(rows)[:1900] + "\n```\n" + dstamp(snap))
 
 
-@bot.command(name="chart30")
+@bot.command(name="chart30", brief="30天每日價格區間圖",
+              description="電視台鑰匙近 30 天每日高低區間＋現價/補貨價線（圖片）。\n會先自動重抓。\n例: !chart30")
 async def chart30_cmd(ctx):
     await _send_bands(ctx, "day30")
 
 
-@bot.command(name="chart100")
+@bot.command(name="chart100", brief="近100天每週價格區間圖",
+              description="電視台鑰匙近 100 天每週高低區間（圖片）。\n會先自動重抓。\n例: !chart100")
 async def chart100_cmd(ctx):
     await _send_bands(ctx, "weeks")
 
 
-@bot.command(name="chart")
+@bot.command(name="chart", brief="鑰匙總覽圖（= !chart30）",
+              description="同 !chart30。\n例: !chart")
 async def chart_cmd(ctx):
     await _send_bands(ctx, "day30")  # 別名: 同 !chart30
 
@@ -477,7 +484,8 @@ async def _send_bands(ctx, mode):
                    else "🔑 **電視台鑰匙 近 100 天週區間**\n" + dstamp(snap), file=discord.File(path))
 
 
-@bot.command(name="sell")
+@bot.command(name="sell", brief="全站賣出推薦 Top15",
+              description="依推薦分排序：淨收入、在售、好賣度、建議標籤。\n可用關鍵字篩選（比對大類/分類/中英文名）。\n例: !sell / !sell 勞力士")
 async def sell_cmd(ctx, *, query=""):
     snap = bot.snapshot()
     q = query.strip().lower()
@@ -571,33 +579,39 @@ async def _top_misc(ctx, rarity, kind, color, n=20):
         await ctx.send(embed=emb)
 
 
-@bot.command(name="top")
+@bot.command(name="top", brief="雜物賣出推薦 Top（圖片表）",
+              description="雜物大類全部稀有度的推薦 Top（圖片表格，畫不出來自動退回文字）。\n例: !top / !top 10（1~25）")
 async def top_cmd(ctx, n: int = 20):
     await _top_misc(ctx, None, "", 0xf0b429, n)
 
 
-@bot.command(name="topg")
+@bot.command(name="topg", brief="金色雜物賣出推薦 Top（圖片表）",
+              description="只看稀有度 5.0（金）的雜物（圖片表格）。\n例: !topg / !topg 10")
 async def topg_cmd(ctx, n: int = 20):
     await _top_misc(ctx, 5.0, "金", 0xf0b429, n)
 
 
-@bot.command(name="topp")
+@bot.command(name="topp", brief="紫色雜物賣出推薦 Top（圖片表）",
+              description="只看稀有度 4.0（紫）的雜物（圖片表格）。\n例: !topp / !topp 10")
 async def topp_cmd(ctx, n: int = 20):
     await _top_misc(ctx, 4.0, "紫", 0x9b59b6, n)
 
 
-@bot.command(name="topb")
+@bot.command(name="topb", brief="藍色雜物賣出推薦 Top（圖片表）",
+              description="只看稀有度 3.0（藍）的雜物（圖片表格）。\n例: !topb / !topb 10")
 async def topb_cmd(ctx, n: int = 20):
     await _top_misc(ctx, 3.0, "藍", 0x4d9fff, n)
 
 
-@bot.command(name="refresh")
+@bot.command(name="refresh", brief="手動整套重抓",
+              description="觸發 GitHub 全站重抓（約 3~4 分鐘），完成後下指令即是新資料。\n例: !refresh")
 async def refresh_cmd(ctx):
     """手動整套重抓（約 3~4 分鐘），例: !refresh"""
     await _ensure_fresh(ctx, "", "全站資料", timeout=600)
 
 
-@bot.command(name="price")
+@bot.command(name="price", brief="單品評估卡＋30天圖",
+              description="查單一物品：最低價/淨收入/商人價/在售/好賣度/日成交額＋補貨模型＋30天圖（最多3筆）。\n會先自動重抓該物品的分類。\n例: !price 心臟")
 async def price_cmd(ctx, *, query=""):
     query = query.strip().lower()
     if not query:
@@ -641,7 +655,8 @@ async def price_cmd(ctx, *, query=""):
         await ctx.send(embed=emb, files=files)
 
 
-@bot.command()
+@bot.command(brief="設定鑰匙訊號推播頻道",
+             description="訊號變動（深跌/補貨/高價/觀望）才推播到該頻道。\n需「管理頻道」權限；不帶參數＝設在當前頻道。\n例: !setalert #市場警報")
 @commands.has_permissions(manage_channels=True)
 async def setalert(ctx, chan: discord.TextChannel = None):
     chan = chan or ctx.channel
@@ -650,7 +665,8 @@ async def setalert(ctx, chan: discord.TextChannel = None):
     await ctx.send(f"✅ 鑰匙訊號警示已設定到 {chan.mention} (每 30 分鐘檢查, 訊號變動才通知)")
 
 
-@bot.command()
+@bot.command(brief="停止訊號推播",
+             description="關掉警示。\n例: !stopalert")
 @commands.has_permissions(manage_channels=True)
 async def stopalert(ctx):
     bot.config.pop("alert_channel", None)
