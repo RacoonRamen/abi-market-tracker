@@ -63,8 +63,17 @@ def fmt(n):
 
 
 def dstamp(snap):
-    """資料時間小字，附在每則訊息後"""
-    return f"-# 資料時間 {snap.get('generated', '')}"
+    """資料時間小字；超過 20 分鐘自動標警語"""
+    gen = snap.get("generated", "")
+    warn = ""
+    try:
+        t = datetime.strptime(gen, "%Y-%m-%d %H:%M 台北").replace(tzinfo=TAIPEI)
+        age = int((datetime.now(TAIPEI) - t).total_seconds() // 60)
+        if age >= 20:
+            warn = f"⚠ 資料已 {age} 分鐘未更新　"
+    except Exception:
+        pass
+    return f"-# {warn}資料時間 {gen}"
 
 
 def dwidth(s):
@@ -548,7 +557,15 @@ def daily_brief_text(snap):
     tv.sort(key=lambda i: i["low"] / i["buy_price"])
     now = datetime.now(TAIPEI)
     head = "☀️ **早報**" if now.hour < 12 else "🌙 **晚間快報**"
-    lines = [f"{head} {now.strftime('%H:%M')}　{snap.get('generated', '')}", ""]
+    age_txt = ""
+    try:
+        t = datetime.strptime(snap.get("generated", ""), "%Y-%m-%d %H:%M 台北").replace(tzinfo=TAIPEI)
+        age = int((now - t).total_seconds() // 60)
+        if age >= 20:
+            age_txt = f"　⚠ 資料 {age} 分鐘前"
+    except Exception:
+        pass
+    lines = [f"{head} {now.strftime('%H:%M')}　{snap.get('generated', '')}{age_txt}", ""]
 
     def dist(i):
         return (i["low"] / i["buy_price"] - 1) * 100

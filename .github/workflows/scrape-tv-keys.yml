@@ -1,8 +1,8 @@
 name: scrape-tv-keys
-# scraper on GitHub Actions (public repo free), bot on GCP pulls via git
+# NOTE: 站方阻擋雲端 IP（GitHub/Azure/Oracle 皆回 503），本 workflow 抓不到資料。
+# 實際爬蟲在使用者家用 PC 的排程 (run_scrape.ps1, 每 10 分鐘) 執行並 push。
+# 這裡保留手動觸發當備援；資料不新鮮會直接失敗，避免用舊資料覆蓋 repo。
 on:
-  schedule:
-    - cron: "*/5 * * * *"  # GitHub minimum 5 min
   workflow_dispatch:
     inputs:
       minor:
@@ -62,6 +62,18 @@ jobs:
           python abi_page.py --csv prices_all_full.csv --hist tv_keys.csv --history history.json --json snapshot.json
           python abi_tv.py
           python forecast.py --out forecast.json
+
+      - name: verify data is fresh
+        run: |
+          python - <<'PY'
+          import csv, datetime
+          rows = list(csv.DictReader(open('tv_keys.csv', encoding='utf-8-sig')))
+          ts = max(r['fetched_at_utc'] for r in rows if r['lowest_price'] not in ('', '--'))
+          t = datetime.datetime.strptime(ts, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc)
+          age = (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds() / 60
+          print(f'latest price row: {ts} ({age:.0f} min ago)')
+          assert age < 120, 'STALE: scrape returned no data (cloud IP likely blocked)'
+          PY
 
       - name: commit data back
         run: |
