@@ -695,11 +695,36 @@ async def stopalert(ctx):
     await ctx.send("✅ 警示已停止")
 
 
-@bot.command(name="help")
-async def help_cmd(ctx):
-    await ctx.send("```\n!keys    電視台鑰匙補貨推薦\n!chart30 30天每日區間圖\n!chart100 近100天週區間圖\n"
-                   "!sell [關鍵字]  賣出推薦 Top15\n!top [數量] 雜物 Top20\n!topg [數量] 金色雜物 Top20\n!topp [數量] 紫色雜物 Top20\n!topb [數量] 藍色雜物 Top20\n!price 物品關鍵字  單品評估卡+圖表\n!refresh  手動整套重抓\n"
-                   "!setalert #頻道  設定訊號警示\n!stopalert  停止警示\n```")
+BOT_VERSION = "v2.4"
+BOT_CHANGELOG = (
+    "v2.4 (2026-10-20): 圖表標示現價/進貨價差距%, 指令自動重抓對應分類, 每則訊息標資料時間\n"
+    "v2.3 (2026-10-19): !topg/!topp/!topb 稀有度分級（金/紫/藍）圖片表\n"
+    "v2.2 (2026-10-19): 按需抓取（dispatch 指定分類）+ !refresh\n"
+    "v2.1 (2026-10-19): 爬蟲上 GitHub Actions, bot 上 GCP 常駐\n"
+    "v2.0 (2026-10-19): Components V2 警示卡, 對齊表格, matplotlib 圖表"
+)
+
+
+@bot.command(name="help", brief="指令總表＋版本公告",
+             description="列所有指令與版本公告。\n例: !help 或 !help keys")
+async def help_cmd(ctx, cmd_name: str = ""):
+    if cmd_name:
+        c = bot.get_command(cmd_name.lstrip("!"))
+        if c:
+            emb = discord.Embed(title=f"!{c.name}", description=(c.description or c.brief or "無說明"), color=0xf0b429)
+            await ctx.send(embed=emb)
+        else:
+            await ctx.send(f"找不到指令 `{cmd_name}`，用 `!help` 看總表")
+        return
+    lines = ["**指令總表**"]
+    for c in bot.commands:
+        if c.name == "help":
+            continue
+        lines.append(f"`!{c.name}` — {c.brief or ''}　(→ `!help {c.name}` 看細節)")
+    emb = discord.Embed(title=f"ABI 市場 bot {BOT_VERSION}", description="\n".join(lines), color=0xf0b429)
+    emb.add_field(name="版本公告", value=BOT_CHANGELOG, inline=False)
+    emb.set_footer(text="網頁版: https://racoonramen.github.io/abi-market-tracker/dashboard.html")
+    await ctx.send(embed=emb)
 
 
 if __name__ == "__main__":
