@@ -436,8 +436,27 @@ async def ping(ctx):
     await ctx.send("pong 🏓")
 
 
+def best_pick(pool):
+    """最推薦購買: 訊號最好者優先 (deep>buy>wait), 同訊號取距補貨價 % 最小者"""
+    cands = [i for i in pool if i.get("buy_price")]
+    if not cands:
+        return None
+    rank = {"deep": 0, "buy": 1, "wait": 2, "sell": 3}
+    return min(cands, key=lambda i: (rank.get(sig_of(i), 9), i["low"] / i["buy_price"]))
+
+
+def pick_line(i):
+    if not i:
+        return ""
+    sig = sig_of(i)
+    dist = (i["low"] / i["buy_price"] - 1) * 100
+    tag = "💰💰 現在就是深跌" if sig == "deep" else ("💰 最接近進場點" if sig == "buy" else "全場最接近補貨價")
+    return (f"⭐ **最推薦: {i['name']}** — 現價 `{fmt(i['low'])}` / 進貨價 `{fmt(i['buy_price'])}` "
+            f"({dist:+.1f}%) {tag}")
+
+
 @bot.command(name="keys", brief="電視台鑰匙補貨推薦表",
-              description="列出 18 把鑰匙的現價、補貨價（P25）、深跌價（歷史地板×1.03）與距補貨 %。\n會先自動重抓鑰匙分類（約 1~3 分鐘）。\n例: !keys")
+              description="列出 18 把鑰匙的現價、補貨價（P25）、深跌價（歷史地板×1.03）與距補貨 %，並標出最推薦購買。\n會先自動重抓鑰匙分類（約 1~3 分鐘）。\n例: !keys")
 async def keys_cmd(ctx):
     await _ensure_fresh(ctx, TV_MINOR, "電視台鑰匙")
     snap = bot.snapshot()
@@ -449,7 +468,8 @@ async def keys_cmd(ctx):
         dist = (i["low"] / i["buy_price"] - 1) * 100
         rows.append([i["name"], fmt(i["low"]), fmt(i["buy_price"]), fmt(i.get("deep_buy", 0)),
                      f"{dist:+.1f}%", SIG_TXT[sig_of(i)]])
-    await ctx.send("🔑 **電視台鑰匙補貨推薦**\n```\n" + table(rows)[:1900] + "\n```\n" + dstamp(snap))
+    await ctx.send(pick_line(best_pick(pool)) + "\n🔑 **電視台鑰匙補貨推薦**\n```\n"
+                   + table(rows)[:1800] + "\n```\n" + dstamp(snap))
 
 
 @bot.command(name="chart30", brief="30天每日價格區間圖",
@@ -480,8 +500,9 @@ async def _send_bands(ctx, mode):
         await ctx.send("沒有資料 (snapshot.json 缺失或還沒建)"); return
     fname = "tv_overview_30.png" if mode == "day30" else "tv_overview_100.png"
     path = tv_overview_png(pool, os.path.join(CHART_DIR, fname), mode)
-    await ctx.send("🔑 **電視台鑰匙 30 天每日區間**\n" + dstamp(snap) if mode == "day30"
-                   else "🔑 **電視台鑰匙 近 100 天週區間**\n" + dstamp(snap), file=discord.File(path))
+    head = pick_line(best_pick(pool))
+    await ctx.send(head + "\n🔑 **電視台鑰匙 30 天每日區間**\n" + dstamp(snap) if mode == "day30"
+                   else head + "\n🔑 **電視台鑰匙 近 100 天週區間**\n" + dstamp(snap), file=discord.File(path))
 
 
 @bot.command(name="sell", brief="全站賣出推薦 Top15",
