@@ -18,6 +18,7 @@ import sys
 import time
 import unicodedata
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord.ext import commands, tasks
@@ -26,6 +27,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SNAPSHOT = os.path.join(HERE, "snapshot.json")
 HISTORY = os.path.join(HERE, "history.json")
 STATE = os.path.join(HERE, "bot_alert_state.json")
+BRIEF_STATE = os.path.join(HERE, "bot_brief_state.json")
+TAIPEI = timezone(timedelta(hours=8))
+BRIEF_HOURS = (9, 18, 19, 20, 21, 22, 23)  # 台北時間整點推播
 CFG = os.path.join(HERE, "bot_config.json")
 CHART_DIR = os.path.join(HERE, "charts")
 TV_MINOR = "40505"
@@ -449,6 +453,7 @@ class AbiBot(commands.Bot):
 
     async def setup_hook(self):
         self.alert_loop.start()
+        self.brief_loop.start()
 
     def snapshot(self):
         return load_json(SNAPSHOT, {}) or {}
@@ -495,6 +500,80 @@ class AbiBot(commands.Bot):
     @alert_loop.before_loop
     async def before_alert(self):
         await self.wait_until_ready()
+
+    @tasks.loop(minutes=1)
+    async def brief_loop(self):
+        """每日 09:00 與 18:00~23:00 整點推播快報"""
+        now = datetime.now(TAIPEI)
+        if now.hour not in BRIEF_HOURS:
+            return
+        key = now.strftime("%Y-%m-%d-%H")
+        st = load_json(BRIEF_STATE, {}) or {}
+        if st.get("last") == key:
+            return
+        chan_id = self.config.get("brief_channel") or self.config.get("alert_channel")
+        if not chan_id:
+            return
+        txt = daily_brief_text(self.snapshot())
+        if not txt:
+            return
+        try:
+            chan = self.get_channel(int(chan_id)) or await self.fetch_channel(int(chan_id))
+            await chan.send(txt)
+            save_json(BRIEF_STATE, {"last": key})
+        except Exception as e:
+            print("brief send failed:", e)
+
+    @brief_loop.before_loop
+    async def before_brief(self):
+        await self.wait_until_ready()
+
+
+def daily_brief_text(snap):
+    """快報內容: 可買 / 接近 / 該等 / 今日變動"""
+    tv = [i for i in snap.get("items", [])
+          if i["minor"] == TV_MINOR and i.get("buy_price")]
+    if not tv:
+        return None
+    tv.sort(key=lambda i: i["low"] / i["buy_price"])
+    now = datetime.now(TAIPEI)
+    head = "☀️ **早報**" if now.hour < 12 else "🌙 **晚間快報**"
+    lines = [f"{head} {now.strftime('%H:%M')}　{snap.get('generated', '')}", ""]
+
+    def dist(i):
+        return (i["low"] / i["buy_price"] - 1) * 100
+
+    buy = [i for i in tv if dist(i) <= 0]
+    near = [i for i in tv if 0 < dist(i) <= 5]
+    if buy:
+        lines.append("💰 **現在可買（已破補貨價）**")
+        for i in buy[:3]:
+            tag = "　💰💰深跌" if i.get("deep_buy") and i["low"] <= i["deep_buy"] else ""
+            lines.append(f"　• {i['name']}　`{fmt(i['low'])}`（{dist(i):+.1f}%）{tag}")
+    else:
+        lines.append("💰 **現在可買**：無，全場都在補貨價之上")
+    if near:
+        lines.append("⏳ **快到了（距補貨價 5% 內）**")
+        for i in near[:3]:
+            lines.append(f"　• {i['name']}　`{fmt(i['low'])}`（{dist(i):+.1f}%）")
+    far = tv[-1]
+    lines.append(f"🚫 **最貴別追**：{far['name']}（+{dist(far):.1f}%）")
+    # 今日變動最大
+    movers = []
+    for i in tv:
+        d = i.get("day30") or []
+        if len(d) >= 2 and d[-2][1]:
+            chg = (d[-1][1] / d[-2][1] - 1) * 100
+            movers.append((abs(chg), chg, i))
+    if movers:
+        movers.sort(key=lambda t: -t[0])
+        _, chg, i = movers[0]
+        if abs(chg) >= 3:
+            arrow = "📉" if chg < 0 else "📈"
+            lines.append(f"{arrow} **今日變動最大**：{i['name']} {chg:+.1f}%")
+    lines.append("")
+    lines.append("-# 補貨價=P25每日最低價 · 深跌價=30天地板×1.03 · `!keys` 看全部")
+    return "\n".join(lines)
 
 
 def alert_view(lines, generated):
@@ -901,6 +980,23 @@ async def forecast30_cmd(ctx):
              description="用近 100 天每週最低價推估下週的最低價區間，樣本長、波動估得較寬。\n例: !forecast100")
 async def forecast100_cmd(ctx):
     await _send_forecast(ctx, "w1", "下週", "forecast_100.png")
+
+
+@bot.command(name="brief", brief="現在該買什麼（快報）",
+             description="一句話版決策：現在可買、快到了、最貴別追、今日變動最大。\n自動推播時間：台北 09:00、18:00~23:00 整點。\n例: !brief")
+async def brief_cmd(ctx):
+    txt = daily_brief_text(bot.snapshot())
+    await ctx.send(txt or "沒有資料")
+
+
+@bot.command(brief="設定快報推播頻道",
+             description="每日 09:00 與 18:00~23:00 整點推播快報的頻道。需「管理頻道」權限；不帶參數＝當前頻道。\n例: !setbrief #市場警報")
+@commands.has_permissions(manage_channels=True)
+async def setbrief(ctx, chan: discord.TextChannel = None):
+    chan = chan or ctx.channel
+    bot.config["brief_channel"] = chan.id
+    save_json(CFG, bot.config)
+    await ctx.send(f"✅ 快報推播已設定到 {chan.mention}（每日 09:00、18:00~23:00 整點）")
 
 
 @bot.command(brief="設定鑰匙訊號推播頻道",

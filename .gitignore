@@ -2,6 +2,7 @@
 token.txt
 bot_config.json
 bot_alert_state.json
+bot_brief_state.json
 watch_state.json
 *.token
 *.env
