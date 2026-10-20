@@ -74,8 +74,15 @@ jobs:
             else
               git commit -m "auto scrape $(date -u +%FT%TZ)"
             fi
-            git pull --rebase
-            git push
+            for i in 1 2 3 4 5; do
+              git fetch -q origin main
+              if git rebase -X ours origin/main -q && git push -q origin HEAD:main; then
+                echo "pushed (try $i)"; exit 0
+              fi
+              git rebase --abort 2>/dev/null || true
+              sleep 8
+            done
+            echo "push failed after retries"; exit 1
           else
             echo "no changes"
           fi
