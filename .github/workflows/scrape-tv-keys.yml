@@ -27,9 +27,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - run: pip install -r requirements.txt
+
+      - name: cache playwright browsers
+        id: pwcache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-1
+
       - run: python -m playwright install --with-deps chromium
+        if: steps.pwcache.outputs.cache-hit != 'true'
+
+      - run: python -m playwright install chromium
+        if: steps.pwcache.outputs.cache-hit == 'true'
 
       - name: scrape targeted minor
         if: inputs.minor != ''
