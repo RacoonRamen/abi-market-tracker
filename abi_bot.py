@@ -29,7 +29,17 @@ HISTORY = os.path.join(HERE, "history.json")
 STATE = os.path.join(HERE, "bot_alert_state.json")
 BRIEF_STATE = os.path.join(HERE, "bot_brief_state.json")
 TAIPEI = timezone(timedelta(hours=8))
-BRIEF_HOURS = (9, 18, 19, 20, 21, 22, 23)  # 台北時間整點推播
+BRIEF_HOURS = (9, 18, 19, 20, 21, 22, 23)  # 平日: 09:00 與 18:00~23:00（台北時間）
+
+
+def brief_hours(now):
+    """推播時段: 平日 09 + 18~23；週末 12~23 + 00~03（含週末夜跨到週一凌晨）"""
+    wd = now.weekday()  # 0=週一 .. 6=週日
+    if wd >= 5:
+        return set(range(12, 24)) | {0, 1, 2, 3}
+    if (wd - 1) % 7 >= 5:  # 昨天是週末 → 凌晨延長
+        return set(BRIEF_HOURS) | {0, 1, 2, 3}
+    return set(BRIEF_HOURS)
 CFG = os.path.join(HERE, "bot_config.json")
 CHART_DIR = os.path.join(HERE, "charts")
 TV_MINOR = "40505"
@@ -505,7 +515,7 @@ class AbiBot(commands.Bot):
     async def brief_loop(self):
         """每日 09:00 與 18:00~23:00 整點推播快報"""
         now = datetime.now(TAIPEI)
-        if now.hour not in BRIEF_HOURS:
+        if now.hour not in brief_hours(now):
             return
         key = now.strftime("%Y-%m-%d-%H")
         st = load_json(BRIEF_STATE, {}) or {}
@@ -983,7 +993,7 @@ async def forecast100_cmd(ctx):
 
 
 @bot.command(name="brief", brief="現在該買什麼（快報）",
-             description="一句話版決策：現在可買、快到了、最貴別追、今日變動最大。\n自動推播時間：台北 09:00、18:00~23:00 整點。\n例: !brief")
+             description="一句話版決策：現在可買、快到了、最貴別追、今日變動最大。\n自動推播：平日 09:00＋18:00~23:00；週末 12:00~23:00＋00:00~03:00（台北時間）。\n例: !brief")
 async def brief_cmd(ctx):
     txt = daily_brief_text(bot.snapshot())
     await ctx.send(txt or "沒有資料")
@@ -996,7 +1006,9 @@ async def setbrief(ctx, chan: discord.TextChannel = None):
     chan = chan or ctx.channel
     bot.config["brief_channel"] = chan.id
     save_json(CFG, bot.config)
-    await ctx.send(f"✅ 快報推播已設定到 {chan.mention}（每日 09:00、18:00~23:00 整點）")
+    await ctx.send(f"✅ 快報推播已設定到 {chan.mention}\n"
+                   f"　• 平日：09:00、18:00~23:00 整點\n"
+                   f"　• 週末：12:00~23:00、00:00~03:00 整點")
 
 
 @bot.command(brief="設定鑰匙訊號推播頻道",
