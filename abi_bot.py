@@ -209,6 +209,98 @@ def tv_overview_png(snap_items, out_path, mode="day30"):
     return out_path
 
 
+def kline_png(item, h, out_path, days=30):
+    """單品 K 線: 實體=前日中價→當日中價, 影線=當日 low~high; 含 MA5/MA10/布林通道/補貨線/成交量"""
+    from matplotlib.patches import Rectangle
+    plt = _plt()
+    rows = []
+    for r in h.get("day", []):
+        try:
+            part = r[1].replace(",", "").split("~")
+            lo = int(part[0].strip())
+            hi = int(part[1].strip()) if len(part) > 1 else lo
+        except Exception:
+            continue
+        vol = 0
+        try:
+            vol = int(r[2].split("/")[-1].replace(",", "").strip())
+        except Exception:
+            pass
+        rows.append((r[0].split(" ")[0], lo, hi, vol))
+    rows = rows[::-1][-days:]  # 轉時間正序
+    if len(rows) < 3:
+        return None
+    dates = [r[0][5:] for r in rows]
+    lows = [r[1] for r in rows]
+    highs = [r[2] for r in rows]
+    vols = [r[3] for r in rows]
+    mids = [(a + b) / 2 for a, b in zip(lows, highs)]
+    opens = [mids[0]] + mids[:-1]
+    n = len(rows)
+    fig, (axp, axv) = plt.subplots(2, 1, figsize=(11, 6.6), facecolor=BG, sharex=True,
+                                   gridspec_kw={"height_ratios": [3.2, 1]})
+    axp.set_facecolor(PANEL)
+    axv.set_facecolor(PANEL)
+    for i in range(n):
+        o, c, lo, hi = opens[i], mids[i], lows[i], highs[i]
+        col = GREEN if c >= o else RED
+        axp.plot([i, i], [lo, hi], color=col, lw=1.1)
+        b_lo, b_hi = min(o, c), max(o, c)
+        if b_hi == b_lo:
+            b_hi = b_lo * 1.001
+        axp.add_patch(Rectangle((i - 0.3, b_lo), 0.6, b_hi - b_lo,
+                                facecolor=col, edgecolor=col, alpha=0.9, zorder=3))
+        axv.bar(i, vols[i], width=0.6, color=col, alpha=0.55)
+    # 均線
+    def ma(vals, w):
+        return [None if i < w - 1 else sum(vals[i - w + 1:i + 1]) / w for i in range(len(vals))]
+    xs = list(range(n))
+    for w, col in ((5, BLUE), (10, "#c9a0ff")):
+        m = ma(mids, w)
+        axp.plot(xs, [v if v else float("nan") for v in m], color=col, lw=1.4, label=f"MA{w}")
+    # 布林通道 (20, 2σ)
+    if n >= 20:
+        mid20, up, dn = [], [], []
+        for i in range(n):
+            if i < 19:
+                mid20.append(float("nan")); up.append(float("nan")); dn.append(float("nan")); continue
+            seg = mids[i - 19:i + 1]
+            mu = sum(seg) / 20
+            sd = (sum((v - mu) ** 2 for v in seg) / 19) ** 0.5
+            mid20.append(mu); up.append(mu + 2 * sd); dn.append(mu - 2 * sd)
+        axp.plot(xs, up, color=DIM, lw=1, ls="--", alpha=0.8, label="布林上軌")
+        axp.plot(xs, dn, color=DIM, lw=1, ls="--", alpha=0.8, label="布林下軌")
+        axp.fill_between(xs, dn, up, color=BLUE, alpha=0.06)
+    # 水平線
+    if item.get("buy_price"):
+        axp.axhline(item["buy_price"], color=GOLD, ls=":", lw=1.5,
+                    label=f"補貨價 {fmt(item['buy_price'])}")
+    if item.get("deep_buy"):
+        axp.axhline(item["deep_buy"], color=RED, ls=":", lw=1.2,
+                    label=f"深跌價 {fmt(item['deep_buy'])}")
+    axp.axhline(item["low"], color=GREEN, lw=1.6, label=f"現價 {fmt(item['low'])}")
+    dist = (item["low"] / item["buy_price"] - 1) * 100 if item.get("buy_price") else 0
+    axp.set_title(f"{item['name']}　日 K 線（{n} 天）　現價 {fmt(item['low'])}"
+                  f"　距補貨價 {dist:+.1f}%", color=GOLD, fontsize=12.5, pad=10)
+    axp.legend(facecolor=PANEL, labelcolor="#e6e9f0", fontsize=8, edgecolor=LINE,
+               loc="upper left", ncol=3, framealpha=0.85)
+    axp.grid(color=LINE, alpha=0.25, lw=0.6)
+    axv.set_ylabel("成交量", color=DIM, fontsize=8)
+    axv.grid(color=LINE, alpha=0.25, lw=0.6)
+    axv.set_xticks(xs)
+    step = max(1, n // 10)
+    axv.set_xticklabels([d if i % step == 0 else "" for i, d in enumerate(dates)],
+                        color=DIM, fontsize=8, rotation=0)
+    for ax in (axp, axv):
+        ax.tick_params(colors=DIM, labelsize=8)
+        for sp in ax.spines.values():
+            sp.set_color(LINE)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130, facecolor=BG)
+    plt.close(fig)
+    return out_path
+
+
 def item_chart_png(item, h, out_path):
     plt = _plt()
     fig, ax = plt.subplots(figsize=(9, 4.5), facecolor=BG)
@@ -704,6 +796,38 @@ async def price_cmd(ctx, *, query=""):
                 print("chart fail:", e)
         emb.set_footer(text=f"資料時間 {snap.get('generated', '')}")
         await ctx.send(embed=emb, files=files)
+
+
+@bot.command(name="kline", brief="單品日 K 線（均線／布林／補貨線／成交量）",
+             description="像股票 K 線一樣看單把鑰匙：實體=前日中價→當日中價, 影線=當日最低~最高, 附 MA5/MA10、布林通道(20,2σ)、補貨價/深跌價/現價線、成交量。\n例: !kline 企劃室")
+async def kline_cmd(ctx, *, query=""):
+    query = query.strip().lower()
+    if not query:
+        await ctx.send("用法: `!kline 鑰匙關鍵字`（例: !kline 企劃室）"); return
+    snap = bot.snapshot()
+    pool = [i for i in snap.get("items", [])
+            if i["minor"] == TV_MINOR
+            and (query in i["name"].lower() or query in i.get("name_en", "").lower())]
+    if not pool:
+        await ctx.send("找不到符合的鑰匙"); return
+    item = pool[0]
+    hist = load_json(HISTORY, {})
+    h = hist.get(item["id"], {})
+    if not h.get("day"):
+        await ctx.send("這把還沒有歷史資料"); return
+    os.makedirs(CHART_DIR, exist_ok=True)
+    try:
+        path = kline_png(item, h, os.path.join(CHART_DIR, f"kline_{item['id']}.png"))
+        if not path:
+            await ctx.send("歷史資料不足（需 ≥3 天）"); return
+        d = (item["low"] / item["buy_price"] - 1) * 100 if item.get("buy_price") else 0
+        await ctx.send(
+            f"📈 **{item['name']}**　現價 `{fmt(item['low'])}`　補貨價 `{fmt(item.get('buy_price', 0))}`"
+            f"（{d:+.1f}%）　深跌價 `{fmt(item.get('deep_buy', 0))}`\n{dstamp(snap)}",
+            file=discord.File(path))
+    except Exception as e:
+        print("kline fail:", e)
+        await ctx.send("K 線繪製失敗，請看主機 log")
 
 
 def forecast_rows(fc, band):
