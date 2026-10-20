@@ -10,6 +10,7 @@
   !stopalert / !ping / !help
 """
 import asyncio
+import csv
 import json
 import math
 import os
@@ -43,6 +44,37 @@ def brief_hours(now):
 CFG = os.path.join(HERE, "bot_config.json")
 CHART_DIR = os.path.join(HERE, "charts")
 TV_MINOR = "40505"
+TV_CSV = os.path.join(HERE, "tv_keys.csv")
+_price_cache = {"mtime": 0.0, "ts": None}
+
+
+def price_time():
+    """tv_keys.csv 裡最後一筆「真的有價格」的抓取時間 (台北 datetime)"""
+    try:
+        mt = os.path.getmtime(TV_CSV)
+    except OSError:
+        return None
+    if _price_cache["mtime"] != mt:
+        latest = None
+        try:
+            with open(TV_CSV, encoding="utf-8-sig") as f:
+                for r in csv.DictReader(f):
+                    lp = (r.get("lowest_price") or "").strip()
+                    ts = (r.get("fetched_at_utc") or "").strip()
+                    if lp and lp != "--" and ts and (latest is None or ts > latest):
+                        latest = ts
+        except Exception:
+            pass
+        _price_cache["mtime"] = mt
+        _price_cache["ts"] = latest
+    ts = _price_cache["ts"]
+    if not ts:
+        return None
+    try:
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc).astimezone(TAIPEI)
+    except Exception:
+        return None
 TV_MAJOR = {"1": "🔫武器", "201": "🔧武器配件", "202": "🧿彈藥", "301": "🎒裝備",
             "401": "💊醫療用品", "404": "🥤飲食", "405": "🔑鑰匙", "408": "📦雜物", "101": "💣投擲武器"}
 
@@ -63,17 +95,20 @@ def fmt(n):
 
 
 def dstamp(snap):
-    """資料時間小字；超過 20 分鐘自動標警語"""
-    gen = snap.get("generated", "")
-    warn = ""
-    try:
-        t = datetime.strptime(gen, "%Y-%m-%d %H:%M 台北").replace(tzinfo=TAIPEI)
-        age = int((datetime.now(TAIPEI) - t).total_seconds() // 60)
-        if age >= 20:
-            warn = f"⚠ 資料已 {age} 分鐘未更新　"
-    except Exception:
-        pass
-    return f"-# {warn}資料時間 {gen}"
+    """標示真實報價時間 (tv_keys.csv 最後一筆) + 快照產生時間; 太舊自動加警語"""
+    pt = price_time()
+    if not pt:
+        return f"-# ⚠ 找不到報價時間 · 快照 {snap.get('generated', '')}"
+    age = int((datetime.now(TAIPEI) - pt).total_seconds() // 60)
+    if age < 120:
+        ago = f"{age} 分鐘前"
+    elif age < 2880:
+        ago = f"{age // 60} 小時前"
+    else:
+        ago = f"{age // 1440} 天前"
+    warn = "⚠ 報價已停止更新　" if age >= 20 else ""
+    return (f"-# {warn}報價時間 {pt.strftime('%m-%d %H:%M')}（{ago}）"
+            f" · 快照 {snap.get('generated', '')}")
 
 
 def dwidth(s):
@@ -557,15 +592,16 @@ def daily_brief_text(snap):
     tv.sort(key=lambda i: i["low"] / i["buy_price"])
     now = datetime.now(TAIPEI)
     head = "☀️ **早報**" if now.hour < 12 else "🌙 **晚間快報**"
-    age_txt = ""
-    try:
-        t = datetime.strptime(snap.get("generated", ""), "%Y-%m-%d %H:%M 台北").replace(tzinfo=TAIPEI)
-        age = int((now - t).total_seconds() // 60)
-        if age >= 20:
-            age_txt = f"　⚠ 資料 {age} 分鐘前"
-    except Exception:
-        pass
-    lines = [f"{head} {now.strftime('%H:%M')}　{snap.get('generated', '')}{age_txt}", ""]
+    pt = price_time()
+    if pt:
+        age = int((now - pt).total_seconds() // 60)
+        ago = f"{age} 分鐘前" if age < 120 else (
+            f"{age // 60} 小時前" if age < 2880 else f"{age // 1440} 天前")
+        warn = "　⚠ 報價已停止更新" if age >= 20 else ""
+        lines = [f"{head} {now.strftime('%H:%M')}　報價 {pt.strftime('%m-%d %H:%M')}"
+                 f"（{ago}）{warn}", ""]
+    else:
+        lines = [f"{head} {now.strftime('%H:%M')}", ""]
 
     def dist(i):
         return (i["low"] / i["buy_price"] - 1) * 100
