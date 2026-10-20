@@ -1,12 +1,12 @@
 name: scrape-tv-keys
-# ?祈??GitHub嚗ublic repo ?祥?⊿?嚗?bot ??GCP 撠???git pull ?郊
+# scraper on GitHub Actions (public repo free), bot on GCP pulls via git
 on:
   schedule:
-    - cron: "*/5 * * * *"  # GitHub ???5 ??
+    - cron: "*/5 * * * *"  # GitHub minimum 5 min
   workflow_dispatch:
     inputs:
       minor:
-        description: "??撠?憿?ID嚗??嚗? 40505嚗?蝛??典?嚗?
+        description: "target minor id (scrape only this, e.g. 40505; empty = full)"
         required: false
         default: ""
 
@@ -51,6 +51,7 @@ jobs:
           python abi_history.py --minor ${{ inputs.minor }} --out history.json
           python abi_page.py --csv prices_all_full.csv --hist tv_keys.csv --history history.json --json snapshot.json
           python abi_tv.py
+          python forecast.py --out forecast.json
 
       - name: scrape full
         if: inputs.minor == ''
@@ -60,12 +61,13 @@ jobs:
           python abi_history.py --minor 104,10101,10102,10103,10104,10105,10106,10108,10201,20101,20102,20103,20104,20105,20106,20107,20108,20110,20111,20112,20114,20115,20116,20201,20202,20203,20204,20205,20206,20208,20209,20210,20212,20213,20214,20215,20217,30102,30103,30104,30105,30106,3010101,3010102,3011502,40101,40103,40104,40105,40401,40402,40501,40502,40503,40504,40507,40801,40802,40803,40804,40805,40806,40807,40808,40809,40810,40812,40813,40814 --budget 8 --out history.json
           python abi_page.py --csv prices_all_full.csv --hist tv_keys.csv --history history.json --json snapshot.json
           python abi_tv.py
+          python forecast.py --out forecast.json
 
       - name: commit data back
         run: |
           git config user.name "abi-scraper"
           git config user.email "abi-scraper@users.noreply.github.com"
-          git add tv_keys.csv history.json history_state.json snapshot.json dashboard.html tv_keys.html
+          git add tv_keys.csv history.json history_state.json snapshot.json dashboard.html tv_keys.html forecast.json
           if ! git diff --cached --quiet; then
             if [ -n "${{ inputs.minor }}" ]; then
               git commit -m "refresh ${{ inputs.minor }} $(date -u +%FT%TZ)"
