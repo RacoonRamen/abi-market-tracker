@@ -9,17 +9,11 @@
   !setalert #頻道      設定鑰匙訊號警示 (Components V2 卡片推播)
   !stopalert / !ping / !help
 """
-import asyncio
-import csv
 import json
 import math
 import os
-import subprocess
 import sys
-import time
 import unicodedata
-import urllib.request
-from datetime import datetime, timedelta, timezone
 
 import discord
 from discord.ext import commands, tasks
@@ -28,53 +22,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SNAPSHOT = os.path.join(HERE, "snapshot.json")
 HISTORY = os.path.join(HERE, "history.json")
 STATE = os.path.join(HERE, "bot_alert_state.json")
-BRIEF_STATE = os.path.join(HERE, "bot_brief_state.json")
-TAIPEI = timezone(timedelta(hours=8))
-BRIEF_HOURS = (9, 18, 19, 20, 21, 22, 23)  # 平日: 09:00 與 18:00~23:00（台北時間）
-
-
-def brief_hours(now):
-    """推播時段: 平日 09 + 18~23；週末 12~23 + 00~03（含週末夜跨到週一凌晨）"""
-    wd = now.weekday()  # 0=週一 .. 6=週日
-    if wd >= 5:
-        return set(range(12, 24)) | {0, 1, 2, 3}
-    if (wd - 1) % 7 >= 5:  # 昨天是週末 → 凌晨延長
-        return set(BRIEF_HOURS) | {0, 1, 2, 3}
-    return set(BRIEF_HOURS)
 CFG = os.path.join(HERE, "bot_config.json")
 CHART_DIR = os.path.join(HERE, "charts")
 TV_MINOR = "40505"
-TV_CSV = os.path.join(HERE, "tv_keys.csv")
-_price_cache = {"mtime": 0.0, "ts": None}
-
-
-def price_time():
-    """tv_keys.csv 裡最後一筆「真的有價格」的抓取時間 (台北 datetime)"""
-    try:
-        mt = os.path.getmtime(TV_CSV)
-    except OSError:
-        return None
-    if _price_cache["mtime"] != mt:
-        latest = None
-        try:
-            with open(TV_CSV, encoding="utf-8-sig") as f:
-                for r in csv.DictReader(f):
-                    lp = (r.get("lowest_price") or "").strip()
-                    ts = (r.get("fetched_at_utc") or "").strip()
-                    if lp and lp != "--" and ts and (latest is None or ts > latest):
-                        latest = ts
-        except Exception:
-            pass
-        _price_cache["mtime"] = mt
-        _price_cache["ts"] = latest
-    ts = _price_cache["ts"]
-    if not ts:
-        return None
-    try:
-        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc).astimezone(TAIPEI)
-    except Exception:
-        return None
 TV_MAJOR = {"1": "🔫武器", "201": "🔧武器配件", "202": "🧿彈藥", "301": "🎒裝備",
             "401": "💊醫療用品", "404": "🥤飲食", "405": "🔑鑰匙", "408": "📦雜物", "101": "💣投擲武器"}
 
@@ -92,24 +42,6 @@ def save_json(path, data):
 
 def fmt(n):
     return f"{n:,.0f}"
-
-
-def dstamp(snap):
-    """標示真實報價時間 (tv_keys.csv 最後一筆) + 快照產生時間; 太舊自動加警語"""
-    pt = price_time()
-    if not pt:
-        return f"-# ⚠ 找不到報價時間 · 快照 {snap.get('generated', '')}"
-    age = int((datetime.now(TAIPEI) - pt).total_seconds() // 60)
-    if age < 120:
-        ago = f"{age} 分鐘前"
-    elif age < 2880:
-        ago = f"{age // 60} 小時前"
-    else:
-        ago = f"{age // 1440} 天前"
-    warn = "⚠ 報價已停止更新　" if age >= 20 else ""
-    snap_gen = snap.get("generated", "")
-    snap_txt = "" if snap_gen.startswith(pt.strftime("%Y-%m-%d %H:%M")) else f" · 快照 {snap_gen}"
-    return (f"-# {warn}報價時間 {pt.strftime('%m-%d %H:%M')}（{ago}）{snap_txt}")
 
 
 def dwidth(s):
@@ -154,17 +86,9 @@ def _plt():
     import matplotlib.pyplot as plt
     from matplotlib import font_manager
     fp = r"C:\Windows\Fonts\msjh.ttc"
-    linux_fps = ["/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-                 "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"]
     if os.path.exists(fp):
         font_manager.fontManager.addfont(fp)
         matplotlib.rcParams["font.family"] = "Microsoft JhengHei"
-    else:
-        for lfp in linux_fps:
-            if os.path.exists(lfp):
-                font_manager.fontManager.addfont(lfp)
-                matplotlib.rcParams["font.family"] = "Noto Sans CJK JP"
-                break
     matplotlib.rcParams["axes.unicode_minus"] = False
     return plt
 
@@ -227,30 +151,27 @@ def tv_overview_png(snap_items, out_path, mode="day30"):
         buy_p = it.get("buy_price") or 0
         if buy_p:
             ax.axhline(buy_p, color=GOLD, ls=":", lw=1.8)
-        # 右側標籤: 現價 (綠) 與補貨價 (金), 避開彼此 + 差額/差%
+        # 右側標籤: 現價 (綠) 與補貨價 (金), 避開彼此
         import matplotlib.transforms as mtransforms
         trans = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
         yr = ax.get_ylim()
         off = (yr[1] - yr[0]) * 0.025
-        gap = cur - buy_p if buy_p else 0
-        gap_pct = (cur / buy_p - 1) * 100 if buy_p else 0
         cur_hi = cur >= buy_p
         if cur_hi:
             ax.text(0.99, cur + off, f"現價 {cur:,}", transform=trans, ha="right",
                     va="bottom", color=GREEN, fontsize=7,
                     bbox=dict(facecolor=BG, alpha=0.55, pad=0.6, edgecolor="none"))
             if buy_p:
-                ax.text(0.99, buy_p - off, f"進貨價 {buy_p:,} (貴 {gap:,} / {gap_pct:+.1f}%)",
-                        transform=trans, ha="right", va="top", color=GOLD, fontsize=7,
+                ax.text(0.99, buy_p - off, f"補貨價 {buy_p:,}", transform=trans, ha="right",
+                        va="top", color=GOLD, fontsize=7,
                         bbox=dict(facecolor=BG, alpha=0.55, pad=0.6, edgecolor="none"))
         else:
             ax.text(0.99, cur - off, f"現價 {cur:,}", transform=trans, ha="right",
                     va="top", color=GREEN, fontsize=7,
                     bbox=dict(facecolor=BG, alpha=0.55, pad=0.6, edgecolor="none"))
-            if buy_p:
-                ax.text(0.99, buy_p + off, f"進貨價 {buy_p:,} (低 {abs(gap):,} / {gap_pct:+.1f}% → 可進)",
-                        transform=trans, ha="right", va="bottom", color=GOLD, fontsize=7,
-                        bbox=dict(facecolor=BG, alpha=0.55, pad=0.6, edgecolor="none"))
+            ax.text(0.99, buy_p + off, f"補貨價 {buy_p:,}", transform=trans, ha="right",
+                    va="bottom", color=GOLD, fontsize=7,
+                    bbox=dict(facecolor=BG, alpha=0.55, pad=0.6, edgecolor="none"))
         name = it["name"]
         short = name[:9] + "…" if len(name) > 10 else name
         mark = {"deep": "💰💰", "buy": "💰", "sell": "⬆", "wait": ""}.get(sig_of(it), "")
@@ -264,98 +185,6 @@ def tv_overview_png(snap_items, out_path, mode="day30"):
         axes[k].axis("off")
     fig.tight_layout()
     fig.savefig(out_path, dpi=110, facecolor=BG)
-    plt.close(fig)
-    return out_path
-
-
-def kline_png(item, h, out_path, days=30):
-    """單品 K 線: 實體=前日中價→當日中價, 影線=當日 low~high; 含 MA5/MA10/布林通道/補貨線/成交量"""
-    from matplotlib.patches import Rectangle
-    plt = _plt()
-    rows = []
-    for r in h.get("day", []):
-        try:
-            part = r[1].replace(",", "").split("~")
-            lo = int(part[0].strip())
-            hi = int(part[1].strip()) if len(part) > 1 else lo
-        except Exception:
-            continue
-        vol = 0
-        try:
-            vol = int(r[2].split("/")[-1].replace(",", "").strip())
-        except Exception:
-            pass
-        rows.append((r[0].split(" ")[0], lo, hi, vol))
-    rows = rows[::-1][-days:]  # 轉時間正序
-    if len(rows) < 3:
-        return None
-    dates = [r[0][5:] for r in rows]
-    lows = [r[1] for r in rows]
-    highs = [r[2] for r in rows]
-    vols = [r[3] for r in rows]
-    mids = [(a + b) / 2 for a, b in zip(lows, highs)]
-    opens = [mids[0]] + mids[:-1]
-    n = len(rows)
-    fig, (axp, axv) = plt.subplots(2, 1, figsize=(11, 6.6), facecolor=BG, sharex=True,
-                                   gridspec_kw={"height_ratios": [3.2, 1]})
-    axp.set_facecolor(PANEL)
-    axv.set_facecolor(PANEL)
-    for i in range(n):
-        o, c, lo, hi = opens[i], mids[i], lows[i], highs[i]
-        col = GREEN if c >= o else RED
-        axp.plot([i, i], [lo, hi], color=col, lw=1.1)
-        b_lo, b_hi = min(o, c), max(o, c)
-        if b_hi == b_lo:
-            b_hi = b_lo * 1.001
-        axp.add_patch(Rectangle((i - 0.3, b_lo), 0.6, b_hi - b_lo,
-                                facecolor=col, edgecolor=col, alpha=0.9, zorder=3))
-        axv.bar(i, vols[i], width=0.6, color=col, alpha=0.55)
-    # 均線
-    def ma(vals, w):
-        return [None if i < w - 1 else sum(vals[i - w + 1:i + 1]) / w for i in range(len(vals))]
-    xs = list(range(n))
-    for w, col in ((5, BLUE), (10, "#c9a0ff")):
-        m = ma(mids, w)
-        axp.plot(xs, [v if v else float("nan") for v in m], color=col, lw=1.4, label=f"MA{w}")
-    # 布林通道 (20, 2σ)
-    if n >= 20:
-        mid20, up, dn = [], [], []
-        for i in range(n):
-            if i < 19:
-                mid20.append(float("nan")); up.append(float("nan")); dn.append(float("nan")); continue
-            seg = mids[i - 19:i + 1]
-            mu = sum(seg) / 20
-            sd = (sum((v - mu) ** 2 for v in seg) / 19) ** 0.5
-            mid20.append(mu); up.append(mu + 2 * sd); dn.append(mu - 2 * sd)
-        axp.plot(xs, up, color=DIM, lw=1, ls="--", alpha=0.8, label="布林上軌")
-        axp.plot(xs, dn, color=DIM, lw=1, ls="--", alpha=0.8, label="布林下軌")
-        axp.fill_between(xs, dn, up, color=BLUE, alpha=0.06)
-    # 水平線
-    if item.get("buy_price"):
-        axp.axhline(item["buy_price"], color=GOLD, ls=":", lw=1.5,
-                    label=f"補貨價 {fmt(item['buy_price'])}")
-    if item.get("deep_buy"):
-        axp.axhline(item["deep_buy"], color=RED, ls=":", lw=1.2,
-                    label=f"深跌價 {fmt(item['deep_buy'])}")
-    axp.axhline(item["low"], color=GREEN, lw=1.6, label=f"現價 {fmt(item['low'])}")
-    dist = (item["low"] / item["buy_price"] - 1) * 100 if item.get("buy_price") else 0
-    axp.set_title(f"{item['name']}　日 K 線（{n} 天）　現價 {fmt(item['low'])}"
-                  f"　距補貨價 {dist:+.1f}%", color=GOLD, fontsize=12.5, pad=10)
-    axp.legend(facecolor=PANEL, labelcolor="#e6e9f0", fontsize=8, edgecolor=LINE,
-               loc="upper left", ncol=3, framealpha=0.85)
-    axp.grid(color=LINE, alpha=0.25, lw=0.6)
-    axv.set_ylabel("成交量", color=DIM, fontsize=8)
-    axv.grid(color=LINE, alpha=0.25, lw=0.6)
-    axv.set_xticks(xs)
-    step = max(1, n // 10)
-    axv.set_xticklabels([d if i % step == 0 else "" for i, d in enumerate(dates)],
-                        color=DIM, fontsize=8, rotation=0)
-    for ax in (axp, axv):
-        ax.tick_params(colors=DIM, labelsize=8)
-        for sp in ax.spines.values():
-            sp.set_color(LINE)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=130, facecolor=BG)
     plt.close(fig)
     return out_path
 
@@ -392,112 +221,6 @@ def item_chart_png(item, h, out_path):
     return out_path
 
 
-def top_table_png(items, out_path, title=None):
-    """雜物 TopN 表格圖 (深色主題, 金字+斑馬紋)"""
-    plt = _plt()
-    rows = []
-    for rank, i in enumerate(items, 1):
-        if i.get("turnover") and i.get("stock_days", 0) and i["stock_days"] < 1:
-            adv = "優先蒐集"
-        elif i.get("count", 0) < 1000 and i["low"] > i.get("ref", 0) * 1.5 and i["low"] > 100000:
-            adv = "稀有好貨"
-        elif i.get("count", 0) >= 10000:
-            adv = "供過於求"
-        else:
-            adv = ""
-        name = i["name"][:13] + "…" if len(i["name"]) > 14 else i["name"]
-        rows.append([rank, name, fmt(i["low"] * 0.935),
-                     fmt(i.get("count", 0)), sell_grade(i), adv])
-    n = len(rows)
-    fig, ax = plt.subplots(figsize=(11, 0.42 * n + 0.9), facecolor=BG)
-    ax.axis("off")
-    plt.subplots_adjust(top=0.88, bottom=0.02, left=0.01, right=0.99)
-    ax.set_title(title or f"雜物賣出推薦 Top{n}", color=GOLD, fontsize=15, pad=12)
-    tab = ax.table(cellText=rows,
-                   colLabels=["#", "物品", "淨收入", "在售", "好賣度", "建議"],
-                   loc="center", colWidths=[0.06, 0.38, 0.16, 0.12, 0.13, 0.15])
-    tab.auto_set_font_size(False)
-    tab.set_fontsize(10.5)
-    for (r, c), cell in tab.get_celld().items():
-        cell.set_edgecolor(LINE)
-        if r == 0:
-            cell.set_facecolor(PANEL)
-            cell.get_text().set_color(GOLD)
-            cell.get_text().set_weight("bold")
-        else:
-            cell.set_facecolor("#151a22" if r % 2 else "#10141b")
-            cell.get_text().set_color("#e6e9f0")
-    fig.savefig(out_path, dpi=130, facecolor=BG, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
-
-
-GH_REPO = "RacoonRamen/abi-market-tracker"
-GH_WORKFLOW = "scrape-tv-keys.yml"
-_last_dispatch = 0.0
-
-
-def _gh_token():
-    try:
-        t = open(os.path.expanduser("~/.github-pat"), encoding="utf-8").read().strip()
-        return t or None
-    except Exception:
-        return None
-
-
-def _dispatch(minor):
-    """觸發 GitHub 指定分類抓取（同步函式，呼叫方用 to_thread）"""
-    tok = _gh_token()
-    if not tok:
-        return "no-pat"
-    try:
-        req = urllib.request.Request(
-            f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{GH_WORKFLOW}/dispatches",
-            data=json.dumps({"ref": "main", "inputs": {"minor": minor}}).encode(),
-            headers={"Accept": "application/vnd.github+json",
-                      "Authorization": f"Bearer {tok}"})
-        urllib.request.urlopen(req, timeout=15)
-        return "ok"
-    except Exception as e:
-        print("dispatch fail:", e)
-        return "fail"
-
-
-def _pull():
-    try:
-        subprocess.run(["git", "-C", HERE, "pull", "--ff-only", "-q"], timeout=60)
-    except Exception as e:
-        print("pull fail:", e)
-
-
-async def _ensure_fresh(ctx, minor, label, timeout=420):
-    """按需抓取：dispatch 指定分類→等 snapshot.json 更新。
-    成功回 True；拿不到（含3分鐘內剛按過）就用舊資料回 False。"""
-    global _last_dispatch
-    try:
-        old_mtime = os.path.getmtime(SNAPSHOT)
-    except OSError:
-        old_mtime = 0
-    now = time.monotonic()
-    if now - _last_dispatch >= 180:
-        st = await asyncio.to_thread(_dispatch, minor)
-        if st == "no-pat":
-            await ctx.send("⏳ 主機還沒放 PAT（`~/.github-pat`），先用舊資料"); return False
-        if st != "ok":
-            await ctx.send("⏳ 觸發失敗，先用舊資料"); return False
-        _last_dispatch = now
-        await ctx.send(f"🔄 正在重抓{label}（約 1~3 分鐘）…")
-    for _ in range(max(1, timeout // 20)):
-        await asyncio.sleep(20)
-        await asyncio.to_thread(_pull)
-        try:
-            if os.path.getmtime(SNAPSHOT) != old_mtime:
-                return True
-        except OSError:
-            pass
-    await ctx.send("⏳ 抓取超時先用舊資料"); return False
-
-
 # ==================== Bot ====================
 class AbiBot(commands.Bot):
     def __init__(self):
@@ -508,7 +231,6 @@ class AbiBot(commands.Bot):
 
     async def setup_hook(self):
         self.alert_loop.start()
-        self.brief_loop.start()
 
     def snapshot(self):
         return load_json(SNAPSHOT, {}) or {}
@@ -517,7 +239,7 @@ class AbiBot(commands.Bot):
         return sorted((i for i in self.snapshot().get("items", []) if i["minor"] == TV_MINOR),
                       key=lambda i: -i["low"])
 
-    @tasks.loop(minutes=5)
+    @tasks.loop(minutes=30)
     async def alert_loop(self):
         items = {i["id"]: i for i in self.snapshot().get("items", [])}
         sig_map = {i["id"]: sig_of(i) for i in items.values() if i["minor"] == TV_MINOR}
@@ -556,89 +278,6 @@ class AbiBot(commands.Bot):
     async def before_alert(self):
         await self.wait_until_ready()
 
-    @tasks.loop(minutes=1)
-    async def brief_loop(self):
-        """每日 09:00 與 18:00~23:00 整點推播快報"""
-        now = datetime.now(TAIPEI)
-        if now.hour not in brief_hours(now):
-            return
-        key = now.strftime("%Y-%m-%d-%H")
-        st = load_json(BRIEF_STATE, {}) or {}
-        if st.get("last") == key:
-            return
-        chan_id = self.config.get("brief_channel") or self.config.get("alert_channel")
-        if not chan_id:
-            return
-        txt = daily_brief_text(self.snapshot())
-        if not txt:
-            return
-        try:
-            chan = self.get_channel(int(chan_id)) or await self.fetch_channel(int(chan_id))
-            await chan.send(txt)
-            save_json(BRIEF_STATE, {"last": key})
-        except Exception as e:
-            print("brief send failed:", e)
-
-    @brief_loop.before_loop
-    async def before_brief(self):
-        await self.wait_until_ready()
-
-
-def daily_brief_text(snap):
-    """快報內容: 可買 / 接近 / 該等 / 今日變動"""
-    tv = [i for i in snap.get("items", [])
-          if i["minor"] == TV_MINOR and i.get("buy_price")]
-    if not tv:
-        return None
-    tv.sort(key=lambda i: i["low"] / i["buy_price"])
-    now = datetime.now(TAIPEI)
-    head = "☀️ **早報**" if now.hour < 12 else "🌙 **晚間快報**"
-    pt = price_time()
-    if pt:
-        age = int((now - pt).total_seconds() // 60)
-        ago = f"{age} 分鐘前" if age < 120 else (
-            f"{age // 60} 小時前" if age < 2880 else f"{age // 1440} 天前")
-        warn = "　⚠ 報價已停止更新" if age >= 20 else ""
-        lines = [f"{head} {now.strftime('%H:%M')}　報價 {pt.strftime('%m-%d %H:%M')}"
-                 f"（{ago}）{warn}", ""]
-    else:
-        lines = [f"{head} {now.strftime('%H:%M')}", ""]
-
-    def dist(i):
-        return (i["low"] / i["buy_price"] - 1) * 100
-
-    buy = [i for i in tv if dist(i) <= 0]
-    near = [i for i in tv if 0 < dist(i) <= 5]
-    if buy:
-        lines.append("💰 **現在可買（已破補貨價）**")
-        for i in buy[:3]:
-            tag = "　💰💰深跌" if i.get("deep_buy") and i["low"] <= i["deep_buy"] else ""
-            lines.append(f"　• {i['name']}　`{fmt(i['low'])}`（{dist(i):+.1f}%）{tag}")
-    else:
-        lines.append("💰 **現在可買**：無，全場都在補貨價之上")
-    if near:
-        lines.append("⏳ **快到了（距補貨價 5% 內）**")
-        for i in near[:3]:
-            lines.append(f"　• {i['name']}　`{fmt(i['low'])}`（{dist(i):+.1f}%）")
-    far = tv[-1]
-    lines.append(f"🚫 **最貴別追**：{far['name']}（+{dist(far):.1f}%）")
-    # 今日變動最大
-    movers = []
-    for i in tv:
-        d = i.get("day30") or []
-        if len(d) >= 2 and d[-2][1]:
-            chg = (d[-1][1] / d[-2][1] - 1) * 100
-            movers.append((abs(chg), chg, i))
-    if movers:
-        movers.sort(key=lambda t: -t[0])
-        _, chg, i = movers[0]
-        if abs(chg) >= 3:
-            arrow = "📉" if chg < 0 else "📈"
-            lines.append(f"{arrow} **今日變動最大**：{i['name']} {chg:+.1f}%")
-    lines.append("")
-    lines.append("-# 補貨價=P25每日最低價 · 深跌價=30天地板×1.03 · `!keys` 看全部")
-    return "\n".join(lines)
-
 
 def alert_view(lines, generated):
     """Components V2 卡片; 失敗時回 None 改用純文字"""
@@ -666,35 +305,13 @@ async def on_ready():
     print(f"已登入: {bot.user}")
 
 
-@bot.command(brief="存活檢查", description="回 pong，確認 bot 還活著。\n例: !ping")
+@bot.command()
 async def ping(ctx):
     await ctx.send("pong 🏓")
 
 
-def best_pick(pool):
-    """最推薦購買: 訊號最好者優先 (deep>buy>wait), 同訊號取距補貨價 % 最小者"""
-    cands = [i for i in pool if i.get("buy_price")]
-    if not cands:
-        return None
-    rank = {"deep": 0, "buy": 1, "wait": 2, "sell": 3}
-    return min(cands, key=lambda i: (rank.get(sig_of(i), 9), i["low"] / i["buy_price"]))
-
-
-def pick_line(i):
-    if not i:
-        return ""
-    sig = sig_of(i)
-    dist = (i["low"] / i["buy_price"] - 1) * 100
-    tag = "💰💰 現在就是深跌" if sig == "deep" else ("💰 最接近進場點" if sig == "buy" else "全場最接近補貨價")
-    return (f"⭐ **最推薦: {i['name']}** — 現價 `{fmt(i['low'])}` / 進貨價 `{fmt(i['buy_price'])}` "
-            f"({dist:+.1f}%) {tag}")
-
-
-@bot.command(name="keys", brief="電視台鑰匙補貨推薦表",
-              description="列出 18 把鑰匙的現價、補貨價（P25）、深跌價（歷史地板×1.03）與距補貨 %，並標出最推薦購買。\n會先自動重抓鑰匙分類（約 1~3 分鐘）。\n例: !keys")
+@bot.command(name="keys")
 async def keys_cmd(ctx):
-    await _ensure_fresh(ctx, TV_MINOR, "電視台鑰匙")
-    snap = bot.snapshot()
     pool = bot.tv_items()
     rows = [["鑰匙", "現價", "補貨價", "深跌價", "距補貨", "狀態"]]
     for i in pool:
@@ -703,45 +320,37 @@ async def keys_cmd(ctx):
         dist = (i["low"] / i["buy_price"] - 1) * 100
         rows.append([i["name"], fmt(i["low"]), fmt(i["buy_price"]), fmt(i.get("deep_buy", 0)),
                      f"{dist:+.1f}%", SIG_TXT[sig_of(i)]])
-    await ctx.send(pick_line(best_pick(pool)) + "\n🔑 **電視台鑰匙補貨推薦**\n```\n"
-                   + table(rows)[:1800] + "\n```\n" + dstamp(snap))
+    await ctx.send("🔑 **電視台鑰匙補貨推薦**\n```\n" + table(rows)[:1900] + "\n```")
 
 
-@bot.command(name="chart30", brief="30天每日價格區間圖",
-              description="電視台鑰匙近 30 天每日高低區間＋現價/補貨價線（圖片）。\n會先自動重抓。\n例: !chart30")
+@bot.command(name="chart30")
 async def chart30_cmd(ctx):
     await _send_bands(ctx, "day30")
 
 
-@bot.command(name="chart100", brief="近100天每週價格區間圖",
-              description="電視台鑰匙近 100 天每週高低區間（圖片）。\n會先自動重抓。\n例: !chart100")
+@bot.command(name="chart100")
 async def chart100_cmd(ctx):
     await _send_bands(ctx, "weeks")
 
 
-@bot.command(name="chart", brief="鑰匙總覽圖（= !chart30）",
-              description="同 !chart30。\n例: !chart")
+@bot.command(name="chart")
 async def chart_cmd(ctx):
     await _send_bands(ctx, "day30")  # 別名: 同 !chart30
 
 
 async def _send_bands(ctx, mode):
     await ctx.typing()
-    await _ensure_fresh(ctx, TV_MINOR, "電視台鑰匙")
     os.makedirs(CHART_DIR, exist_ok=True)
-    snap = bot.snapshot()
     pool = bot.tv_items()
     if not pool:
         await ctx.send("沒有資料 (snapshot.json 缺失或還沒建)"); return
     fname = "tv_overview_30.png" if mode == "day30" else "tv_overview_100.png"
     path = tv_overview_png(pool, os.path.join(CHART_DIR, fname), mode)
-    head = pick_line(best_pick(pool))
-    await ctx.send(head + "\n🔑 **電視台鑰匙 30 天每日區間**\n" + dstamp(snap) if mode == "day30"
-                   else head + "\n🔑 **電視台鑰匙 近 100 天週區間**\n" + dstamp(snap), file=discord.File(path))
+    await ctx.send("🔑 **電視台鑰匙 30 天每日區間**" if mode == "day30"
+                   else "🔑 **電視台鑰匙 近 100 天週區間**", file=discord.File(path))
 
 
-@bot.command(name="sell", brief="全站賣出推薦 Top15",
-              description="依推薦分排序：淨收入、在售、好賣度、建議標籤。\n可用關鍵字篩選（比對大類/分類/中英文名）。\n例: !sell / !sell 勞力士")
+@bot.command(name="sell")
 async def sell_cmd(ctx, *, query=""):
     snap = bot.snapshot()
     q = query.strip().lower()
@@ -771,7 +380,7 @@ async def sell_cmd(ctx, *, query=""):
                      f"{TV_MAJOR.get(i['major'], '')}/{i['cat']}", fmt(i["low"] * 0.935),
                      fmt(i.get("count", 0)), grade, fmt(i.get("score", 0)), adv])
     await ctx.send("💰 **賣出推薦 Top 15**" + (f" [篩選: {query}]" if q else "") +
-                   "\n```\n" + table(rows)[:1900] + "\n```\n" + dstamp(snap))
+                   "\n```\n" + table(rows)[:1900] + "\n```")
 
 
 def sell_grade(i):
@@ -782,122 +391,7 @@ def sell_grade(i):
     return "低競爭" if c < 1000 else ("中" if c < 10000 else "高競爭")
 
 
-RARITY_MAP = None
-
-
-def rarity_of(item_id):
-    """items_index.json 稀有度對照 (快取): 5=金 4=紫 3=藍"""
-    global RARITY_MAP
-    if RARITY_MAP is None:
-        try:
-            raw = load_json(os.path.join(HERE, "items_index.json"), {}) or {}
-            RARITY_MAP = {str(k): v.get("rarity") for k, v in (raw.get("items") or {}).items()}
-        except Exception:
-            RARITY_MAP = {}
-    return RARITY_MAP.get(str(item_id))
-
-
-def forecast_png(rows, out_path, title):
-    """預估圖: rows=[(name, current, lo, hi, center)]; 金帶=預估區間, 綠/紅點=現價"""
-    plt = _plt()
-    rows = sorted(rows, key=lambda r: r[1] / max(1, r[4]))
-    n = len(rows)
-    fig, ax = plt.subplots(figsize=(10.5, 0.42 * n + 1.2), facecolor=BG)
-    ax.set_facecolor(PANEL)
-    for k, (name, cur, lo, hi, c) in enumerate(rows):
-        lo, hi, c, cur = lo / 10000, hi / 10000, c / 10000, cur / 10000
-        ax.plot([lo, hi], [k, k], color=GOLD, lw=7, alpha=0.35, solid_capstyle="round")
-        ax.plot(c, k, "o", color=GOLD, ms=4)
-        inb = lo <= cur <= hi
-        ax.plot(cur, k, "o", color=GREEN if inb else RED, ms=6)
-        ax.text(max(cur, hi) + (hi - lo) * 0.06 + 0.5, k,
-                f"{(cur / c - 1) * 100:+.1f}%", va="center",
-                color=GREEN if inb else RED, fontsize=8)
-    ax.set_yticks(range(n))
-    ax.set_yticklabels([r[0][:11] for r in rows], color="#e6e9f0", fontsize=9)
-    ax.invert_yaxis()  # 最接近進場點的排最上面
-    ax.set_xlabel("價格 (萬)", color=DIM, fontsize=9)
-    ax.tick_params(colors=DIM, labelsize=8)
-    for sp in ax.spines.values():
-        sp.set_color(LINE)
-    ax.set_title(title, color=GOLD, fontsize=11, pad=10)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=130, facecolor=BG)
-    plt.close(fig)
-    return out_path
-
-
-async def _top_misc(ctx, rarity, kind, color, n=20):
-    """雜物指定稀有度 TopN (rarity=None 全部), 例: !topg 10"""
-    n = max(1, min(n, 25))
-    label = f"{kind}色雜物" if kind else "雜物"
-    snap = bot.snapshot()
-    pool = [i for i in snap.get("items", [])
-            if str(i.get("major")) == "408"
-            and (rarity is None or rarity_of(i.get("id")) == rarity)]
-    pool.sort(key=lambda i: -i.get("score", 0))
-    if not pool:
-        await ctx.send("沒有資料 (snapshot.json 缺失或還沒建)"); return
-    medals = ["🥇", "🥈", "🥉"]
-    lines = []
-    for rank, i in enumerate(pool[:n], 1):
-        if i.get("turnover") and i.get("stock_days", 0) and i["stock_days"] < 1:
-            adv = " 🥇優先蒐集"
-        elif i.get("count", 0) < 1000 and i["low"] > i.get("ref", 0) * 1.5 and i["low"] > 100000:
-            adv = " 💎稀有好貨"
-        elif i.get("count", 0) >= 10000:
-            adv = " ⚠供過於求"
-        else:
-            adv = ""
-        mark = medals[rank - 1] + " " if rank <= 3 else f"`{rank}.` "
-        lines.append(f"{mark}**{i['name']}** — 淨收入 `{fmt(i['low'] * 0.935)}` · "
-                     f"在售 `{fmt(i.get('count', 0))}` · {sell_grade(i)}{adv}")
-    os.makedirs(CHART_DIR, exist_ok=True)
-    try:
-        path = top_table_png(pool[:n], os.path.join(CHART_DIR, f"top_misc_{'all' if rarity is None else int(rarity)}.png"),
-                             title=f"{label}賣出推薦 Top{n}")
-        await ctx.send(f"📦 **{label}賣出推薦 Top{n}**（資料更新於 {snap.get('generated', '')}）",
-                       file=discord.File(path))
-    except Exception as e:
-        print("top chart fail:", e)
-        emb = discord.Embed(title=f"📦 {label}賣出推薦 Top{n}", description="\n".join(lines), color=color)
-        emb.set_footer(text=f"資料更新於 {snap.get('generated', '')}")
-        await ctx.send(embed=emb)
-
-
-@bot.command(name="top", brief="雜物賣出推薦 Top（圖片表）",
-              description="雜物大類全部稀有度的推薦 Top（圖片表格，畫不出來自動退回文字）。\n例: !top / !top 10（1~25）")
-async def top_cmd(ctx, n: int = 20):
-    await _top_misc(ctx, None, "", 0xf0b429, n)
-
-
-@bot.command(name="topg", brief="金色雜物賣出推薦 Top（圖片表）",
-              description="只看稀有度 5.0（金）的雜物（圖片表格）。\n例: !topg / !topg 10")
-async def topg_cmd(ctx, n: int = 20):
-    await _top_misc(ctx, 5.0, "金", 0xf0b429, n)
-
-
-@bot.command(name="topp", brief="紫色雜物賣出推薦 Top（圖片表）",
-              description="只看稀有度 4.0（紫）的雜物（圖片表格）。\n例: !topp / !topp 10")
-async def topp_cmd(ctx, n: int = 20):
-    await _top_misc(ctx, 4.0, "紫", 0x9b59b6, n)
-
-
-@bot.command(name="topb", brief="藍色雜物賣出推薦 Top（圖片表）",
-              description="只看稀有度 3.0（藍）的雜物（圖片表格）。\n例: !topb / !topb 10")
-async def topb_cmd(ctx, n: int = 20):
-    await _top_misc(ctx, 3.0, "藍", 0x4d9fff, n)
-
-
-@bot.command(name="refresh", brief="手動整套重抓",
-              description="觸發 GitHub 全站重抓（約 3~4 分鐘），完成後下指令即是新資料。\n例: !refresh")
-async def refresh_cmd(ctx):
-    """手動整套重抓（約 3~4 分鐘），例: !refresh"""
-    await _ensure_fresh(ctx, "", "全站資料", timeout=600)
-
-
-@bot.command(name="price", brief="單品評估卡＋30天圖",
-              description="查單一物品：最低價/淨收入/商人價/在售/好賣度/日成交額＋補貨模型＋30天圖（最多3筆）。\n會先自動重抓該物品的分類。\n例: !price 心臟")
+@bot.command(name="price")
 async def price_cmd(ctx, *, query=""):
     query = query.strip().lower()
     if not query:
@@ -908,15 +402,6 @@ async def price_cmd(ctx, *, query=""):
     pool.sort(key=lambda i: -i["low"])
     if not pool:
         await ctx.send("找不到符合的物品"); return
-    minor = str(pool[0].get("minor", ""))
-    if minor:
-        await _ensure_fresh(ctx, minor, pool[0]["name"])
-        snap = bot.snapshot()
-        pool = [i for i in snap.get("items", [])
-                if query in i["name"].lower() or query in i.get("name_en", "").lower()]
-        pool.sort(key=lambda i: -i["low"])
-        if not pool:
-            await ctx.send("找不到符合的物品"); return
     os.makedirs(CHART_DIR, exist_ok=True)
     hist = load_json(HISTORY, {})
     for i in pool[:3]:
@@ -937,136 +422,10 @@ async def price_cmd(ctx, *, query=""):
                 files.append(discord.File(fp))
             except Exception as e:
                 print("chart fail:", e)
-        emb.set_footer(text=f"資料時間 {snap.get('generated', '')}")
         await ctx.send(embed=emb, files=files)
 
 
-@bot.command(name="kline", brief="單品日 K 線（均線／布林／補貨線／成交量）",
-             description="像股票 K 線一樣看單把鑰匙：實體=前日中價→當日中價, 影線=當日最低~最高, 附 MA5/MA10、布林通道(20,2σ)、補貨價/深跌價/現價線、成交量。\n例: !kline 企劃室")
-async def kline_cmd(ctx, *, query=""):
-    query = query.strip().lower()
-    if not query:
-        await ctx.send("用法: `!kline 鑰匙關鍵字`（例: !kline 企劃室）"); return
-    snap = bot.snapshot()
-    pool = [i for i in snap.get("items", [])
-            if i["minor"] == TV_MINOR
-            and (query in i["name"].lower() or query in i.get("name_en", "").lower())]
-    if not pool:
-        await ctx.send("找不到符合的鑰匙"); return
-    item = pool[0]
-    hist = load_json(HISTORY, {})
-    h = hist.get(item["id"], {})
-    if not h.get("day"):
-        await ctx.send("這把還沒有歷史資料"); return
-    os.makedirs(CHART_DIR, exist_ok=True)
-    try:
-        path = kline_png(item, h, os.path.join(CHART_DIR, f"kline_{item['id']}.png"))
-        if not path:
-            await ctx.send("歷史資料不足（需 ≥3 天）"); return
-        d = (item["low"] / item["buy_price"] - 1) * 100 if item.get("buy_price") else 0
-        await ctx.send(
-            f"📈 **{item['name']}**　現價 `{fmt(item['low'])}`　補貨價 `{fmt(item.get('buy_price', 0))}`"
-            f"（{d:+.1f}%）　深跌價 `{fmt(item.get('deep_buy', 0))}`\n{dstamp(snap)}",
-            file=discord.File(path))
-    except Exception as e:
-        print("kline fail:", e)
-        await ctx.send("K 線繪製失敗，請看主機 log")
-
-
-def forecast_rows(fc, band):
-    """band='d1' 用 30 天日線 (明日), band='w1' 用 100 天週線 (下週)"""
-    items = [e for e in fc.get("items", {}).values()
-             if e.get(band) and "鑰匙" in str(e.get("name", ""))]
-    return sorted(items, key=lambda e: e["current"] / max(1, e[band]["center"]))
-
-
-def forecast_caption(fc, items, band, period_label):
-    """圖片用的白話說明"""
-    tgt = fc.get("target_label" if band == "d1" else "week_target_label", "")
-    lines = [f"🔮 **{tgt} 電視台鑰匙{period_label}預估**"]
-    for e in items[:5]:
-        b = e[band]
-        chg = (b["center"] / e["current"] - 1) * 100
-        arrow = "⬇️" if chg < 0 else ("⬆️" if chg > 1 else "➡️")
-        tail = ""
-        if e["current"] <= b["lo"]:
-            tail = "　⭐現價已低於預估，可以進"
-        elif chg < -10:
-            tail = "　⏳等跌"
-        lines.append(f"{arrow} **{e['name']}**：預估 {fmt(b['lo'])}~{fmt(b['hi'])}"
-                     f"（中心 {fmt(b['center'])}），比現價 {chg:+.1f}%{tail}")
-    if band == "d1":
-        f, t, n = (min(e.get("data_from", "") for e in items),
-                   max(e.get("data_to", "") for e in items),
-                   max(e.get("days", 0) for e in items))
-        basis = f"{f} ~ {t}（{n} 天每日最低價）"
-    else:
-        f, t, n = (min(e.get("w_from", "") for e in items),
-                   max(e.get("w_to", "") for e in items),
-                   max(e.get("w_n", 0) for e in items))
-        basis = f"{f} ~ {t}（{n} 週每週最低價）"
-    lines.append(f"-# 依據 {basis} · 預估於 {fc.get('generated', '')}"
-                 f" · 金帶=預估區間, 綠點=通道內, 紅點=偏離")
-    return "\n".join(lines)
-
-
-async def _send_forecast(ctx, band, period_label, fname):
-    fc = load_json(os.path.join(HERE, "forecast.json"), {}) or {}
-    items = forecast_rows(fc, band)
-    if not items:
-        await ctx.send("還沒有預估資料 (forecast.json 缺失或該模型資料不足)"); return
-    caption = forecast_caption(fc, items, band, period_label)
-    chart_rows = [(e["name"], e["current"], e[band]["lo"], e[band]["hi"], e[band]["center"])
-                  for e in items]
-    os.makedirs(CHART_DIR, exist_ok=True)
-    try:
-        path = forecast_png(chart_rows, os.path.join(CHART_DIR, fname),
-                            f"{period_label}最低價預估 — 金帶=預估區間, 綠點=通道內, 紅點=偏離, %=現價偏差")
-        await ctx.send(caption, file=discord.File(path))
-    except Exception as e:
-        print("forecast chart fail:", e)
-        await ctx.send(caption)
-
-
-@bot.command(name="forecast", brief="明日最低價預估（圖）",
-             description="用近 30 天每日最低價推估「明天」的價格區間（圖片＋白話摘要）。\n例: !forecast")
-async def forecast_cmd(ctx):
-    await _send_forecast(ctx, "d1", "明日", "forecast_30.png")
-
-
-@bot.command(name="forecast30", brief="明日最低價預估（30天日線）",
-             description="用近 30 天每日最低價推估明天的最低價區間，附圖表與白話摘要。\n例: !forecast30")
-async def forecast30_cmd(ctx):
-    await _send_forecast(ctx, "d1", "明日", "forecast_30.png")
-
-
-@bot.command(name="forecast100", brief="下週最低價預估（100天週線）",
-             description="用近 100 天每週最低價推估下週的最低價區間，樣本長、波動估得較寬。\n例: !forecast100")
-async def forecast100_cmd(ctx):
-    await _send_forecast(ctx, "w1", "下週", "forecast_100.png")
-
-
-@bot.command(name="brief", brief="現在該買什麼（快報）",
-             description="一句話版決策：現在可買、快到了、最貴別追、今日變動最大。\n自動推播：平日 09:00＋18:00~23:00；週末 12:00~23:00＋00:00~03:00（台北時間）。\n例: !brief")
-async def brief_cmd(ctx):
-    txt = daily_brief_text(bot.snapshot())
-    await ctx.send(txt or "沒有資料")
-
-
-@bot.command(brief="設定快報推播頻道",
-             description="每日 09:00 與 18:00~23:00 整點推播快報的頻道。需「管理頻道」權限；不帶參數＝當前頻道。\n例: !setbrief #市場警報")
-@commands.has_permissions(manage_channels=True)
-async def setbrief(ctx, chan: discord.TextChannel = None):
-    chan = chan or ctx.channel
-    bot.config["brief_channel"] = chan.id
-    save_json(CFG, bot.config)
-    await ctx.send(f"✅ 快報推播已設定到 {chan.mention}\n"
-                   f"　• 平日：09:00、18:00~23:00 整點\n"
-                   f"　• 週末：12:00~23:00、00:00~03:00 整點")
-
-
-@bot.command(brief="設定鑰匙訊號推播頻道",
-             description="訊號變動（深跌/補貨/高價/觀望）才推播到該頻道。\n需「管理頻道」權限；不帶參數＝設在當前頻道。\n例: !setalert #市場警報")
+@bot.command()
 @commands.has_permissions(manage_channels=True)
 async def setalert(ctx, chan: discord.TextChannel = None):
     chan = chan or ctx.channel
@@ -1075,8 +434,7 @@ async def setalert(ctx, chan: discord.TextChannel = None):
     await ctx.send(f"✅ 鑰匙訊號警示已設定到 {chan.mention} (每 30 分鐘檢查, 訊號變動才通知)")
 
 
-@bot.command(brief="停止訊號推播",
-             description="關掉警示。\n例: !stopalert")
+@bot.command()
 @commands.has_permissions(manage_channels=True)
 async def stopalert(ctx):
     bot.config.pop("alert_channel", None)
@@ -1084,36 +442,11 @@ async def stopalert(ctx):
     await ctx.send("✅ 警示已停止")
 
 
-BOT_VERSION = "v2.4"
-BOT_CHANGELOG = (
-    "v2.4 (2026-10-20): 圖表標示現價/進貨價差距%, 指令自動重抓對應分類, 每則訊息標資料時間\n"
-    "v2.3 (2026-10-19): !topg/!topp/!topb 稀有度分級（金/紫/藍）圖片表\n"
-    "v2.2 (2026-10-19): 按需抓取（dispatch 指定分類）+ !refresh\n"
-    "v2.1 (2026-10-19): 爬蟲上 GitHub Actions, bot 上 GCP 常駐\n"
-    "v2.0 (2026-10-19): Components V2 警示卡, 對齊表格, matplotlib 圖表"
-)
-
-
-@bot.command(name="help", brief="指令總表＋版本公告",
-             description="列所有指令與版本公告。\n例: !help 或 !help keys")
-async def help_cmd(ctx, cmd_name: str = ""):
-    if cmd_name:
-        c = bot.get_command(cmd_name.lstrip("!"))
-        if c:
-            emb = discord.Embed(title=f"!{c.name}", description=(c.description or c.brief or "無說明"), color=0xf0b429)
-            await ctx.send(embed=emb)
-        else:
-            await ctx.send(f"找不到指令 `{cmd_name}`，用 `!help` 看總表")
-        return
-    lines = ["**指令總表**"]
-    for c in bot.commands:
-        if c.name == "help":
-            continue
-        lines.append(f"`!{c.name}` — {c.brief or ''}　(→ `!help {c.name}` 看細節)")
-    emb = discord.Embed(title=f"ABI 市場 bot {BOT_VERSION}", description="\n".join(lines), color=0xf0b429)
-    emb.add_field(name="版本公告", value=BOT_CHANGELOG, inline=False)
-    emb.set_footer(text="網頁版: https://racoonramen.github.io/abi-market-tracker/dashboard.html")
-    await ctx.send(embed=emb)
+@bot.command(name="help")
+async def help_cmd(ctx):
+    await ctx.send("```\n!keys    電視台鑰匙補貨推薦\n!chart30 30天每日區間圖\n!chart100 近100天週區間圖\n"
+                   "!sell [關鍵字]  賣出推薦 Top15\n!price 物品關鍵字  單品評估卡+圖表\n"
+                   "!setalert #頻道  設定訊號警示\n!stopalert  停止警示\n```")
 
 
 if __name__ == "__main__":
