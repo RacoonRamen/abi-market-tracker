@@ -179,6 +179,27 @@ def load_site_history(path):
         return {}
 
 
+def quote_stamp(csv_path):
+    """CSV 最後一筆有效報價時間 (台北字串): 網頁要顯示真實資料時間"""
+    latest = None
+    try:
+        with open(csv_path, encoding="utf-8-sig") as f:
+            for r in csv.DictReader(f):
+                lp = (r.get("lowest_price") or "").strip()
+                ts = (r.get("fetched_at_utc") or "").strip()
+                if lp and lp != "--" and ts and (latest is None or ts > latest):
+                    latest = ts
+    except Exception:
+        return None
+    if not latest:
+        return None
+    try:
+        dt = datetime.strptime(latest, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return dt.astimezone(TAIPEI).strftime("%Y-%m-%d %H:%M 台北")
+    except Exception:
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", default="tv_keys.csv", help="本系統追蹤 CSV (現價/走勢)")
@@ -291,7 +312,7 @@ def main():
     summary = """<table class="summary"><tr><th>鑰匙</th><th>現價</th><th>買入線</th><th>賣出目標</th><th>日成交量</th><th>日成交額</th><th>在售</th></tr>
 """ + "\n".join(rows) + "</table>"
 
-    now = datetime.now(TAIPEI).strftime("%Y-%m-%d %H:%M 台北")
+    now = quote_stamp(args.csv) or datetime.now(TAIPEI).strftime("%Y-%m-%d %H:%M 台北")
     html = PAGE.replace("__SUMMARY__", summary).replace("__CARDS__", "\n".join(cards)) \
                .replace("__UNLISTED__", "、".join(unlisted)).replace("__GENERATED__", now)
     with open(args.out, "w", encoding="utf-8") as f:

@@ -107,8 +107,9 @@ def dstamp(snap):
     else:
         ago = f"{age // 1440} 天前"
     warn = "⚠ 報價已停止更新　" if age >= 20 else ""
-    return (f"-# {warn}報價時間 {pt.strftime('%m-%d %H:%M')}（{ago}）"
-            f" · 快照 {snap.get('generated', '')}")
+    snap_gen = snap.get("generated", "")
+    snap_txt = "" if snap_gen.startswith(pt.strftime("%Y-%m-%d %H:%M")) else f" · 快照 {snap_gen}"
+    return (f"-# {warn}報價時間 {pt.strftime('%m-%d %H:%M')}（{ago}）{snap_txt}")
 
 
 def dwidth(s):

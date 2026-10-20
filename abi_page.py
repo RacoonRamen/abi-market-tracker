@@ -747,6 +747,28 @@ def load_hist(path, max_points=24):
     return out
 
 
+def quote_stamp(csv_path):
+    """tv_keys.csv 最後一筆有效報價時間 (台北字串); 讓網頁顯示「真實資料時間」而非建置時間"""
+    latest = None
+    try:
+        import csv as _csv
+        with open(csv_path, encoding="utf-8-sig") as f:
+            for r in _csv.DictReader(f):
+                lp = (r.get("lowest_price") or "").strip()
+                ts = (r.get("fetched_at_utc") or "").strip()
+                if lp and lp != "--" and ts and (latest is None or ts > latest):
+                    latest = ts
+    except Exception:
+        return None
+    if not latest:
+        return None
+    try:
+        dt = datetime.strptime(latest, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return dt.astimezone(TAIPEI).strftime("%Y-%m-%d %H:%M 台北")
+    except Exception:
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", default="prices_all_full.csv")
@@ -845,7 +867,8 @@ def main():
 
     cats = [{"minor": m, "name": cat_zh.get(m, name), "major": MINOR_TO_MAJOR.get(m, "?"), "n": n}
             for (m, name), n in cats_n.items()]
-    payload = {"generated": datetime.now(TAIPEI).strftime("%Y-%m-%d %H:%M 台北"),
+    payload = {"generated": quote_stamp(args.hist)
+               or datetime.now(TAIPEI).strftime("%Y-%m-%d %H:%M 台北"),
                "majors": MAJORS, "cats": cats, "items": items,
                "tv_unlisted": tv_unlisted}
 
