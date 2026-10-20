@@ -48,6 +48,11 @@ def fmt(n):
     return f"{n:,.0f}"
 
 
+def dstamp(snap):
+    """資料時間小字，附在每則訊息後"""
+    return f"-# 資料時間 {snap.get('generated', '')}"
+
+
 def dwidth(s):
     """顯示寬度: 全形/CJK = 2"""
     return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(s))
@@ -431,6 +436,7 @@ async def ping(ctx):
 @bot.command(name="keys")
 async def keys_cmd(ctx):
     await _ensure_fresh(ctx, TV_MINOR, "電視台鑰匙")
+    snap = bot.snapshot()
     pool = bot.tv_items()
     rows = [["鑰匙", "現價", "補貨價", "深跌價", "距補貨", "狀態"]]
     for i in pool:
@@ -439,7 +445,7 @@ async def keys_cmd(ctx):
         dist = (i["low"] / i["buy_price"] - 1) * 100
         rows.append([i["name"], fmt(i["low"]), fmt(i["buy_price"]), fmt(i.get("deep_buy", 0)),
                      f"{dist:+.1f}%", SIG_TXT[sig_of(i)]])
-    await ctx.send("🔑 **電視台鑰匙補貨推薦**\n```\n" + table(rows)[:1900] + "\n```")
+    await ctx.send("🔑 **電視台鑰匙補貨推薦**\n```\n" + table(rows)[:1900] + "\n```\n" + dstamp(snap))
 
 
 @bot.command(name="chart30")
@@ -461,13 +467,14 @@ async def _send_bands(ctx, mode):
     await ctx.typing()
     await _ensure_fresh(ctx, TV_MINOR, "電視台鑰匙")
     os.makedirs(CHART_DIR, exist_ok=True)
+    snap = bot.snapshot()
     pool = bot.tv_items()
     if not pool:
         await ctx.send("沒有資料 (snapshot.json 缺失或還沒建)"); return
     fname = "tv_overview_30.png" if mode == "day30" else "tv_overview_100.png"
     path = tv_overview_png(pool, os.path.join(CHART_DIR, fname), mode)
-    await ctx.send("🔑 **電視台鑰匙 30 天每日區間**" if mode == "day30"
-                   else "🔑 **電視台鑰匙 近 100 天週區間**", file=discord.File(path))
+    await ctx.send("🔑 **電視台鑰匙 30 天每日區間**\n" + dstamp(snap) if mode == "day30"
+                   else "🔑 **電視台鑰匙 近 100 天週區間**\n" + dstamp(snap), file=discord.File(path))
 
 
 @bot.command(name="sell")
@@ -500,7 +507,7 @@ async def sell_cmd(ctx, *, query=""):
                      f"{TV_MAJOR.get(i['major'], '')}/{i['cat']}", fmt(i["low"] * 0.935),
                      fmt(i.get("count", 0)), grade, fmt(i.get("score", 0)), adv])
     await ctx.send("💰 **賣出推薦 Top 15**" + (f" [篩選: {query}]" if q else "") +
-                   "\n```\n" + table(rows)[:1900] + "\n```")
+                   "\n```\n" + table(rows)[:1900] + "\n```\n" + dstamp(snap))
 
 
 def sell_grade(i):
@@ -630,6 +637,7 @@ async def price_cmd(ctx, *, query=""):
                 files.append(discord.File(fp))
             except Exception as e:
                 print("chart fail:", e)
+        emb.set_footer(text=f"資料時間 {snap.get('generated', '')}")
         await ctx.send(embed=emb, files=files)
 
 
