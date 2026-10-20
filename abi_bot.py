@@ -676,6 +676,27 @@ async def price_cmd(ctx, *, query=""):
         await ctx.send(embed=emb, files=files)
 
 
+@bot.command(name="forecast", brief="明日價格預估通道",
+             description="均值回歸通道模型：用 30 天每日低點預估明日/3日/7日最低價區間，並標出現價落在通道哪裡。\n例: !forecast")
+async def forecast_cmd(ctx):
+    fc = load_json(os.path.join(HERE, "forecast.json"), {}) or {}
+    items = fc.get("items", {})
+    if not items:
+        await ctx.send("還沒有預估資料 (forecast.json 缺失)"); return
+    snap = bot.snapshot()
+    rows = [["物品", "現價", "明日區間", "偏差", "位置"]]
+    # 只看鑰匙, 依偏差由小到大（最接近進場點排前面）
+    tv = [(e["name"], e) for iid, e in items.items() if str(iid).startswith("40505") and e.get("d1")]
+    tv.sort(key=lambda kv: kv[1]["current"] / max(1, kv[1]["d1"]["center"]))
+    for name, e in tv[:12]:
+        d1 = e["d1"]
+        gap = (e["current"] / d1["center"] - 1) * 100
+        pos = {"below-band": "⭐已破下緣", "low-band": "💰下緣區"}.get(e["signal"], "—通道內")
+        rows.append([name[:10], fmt(e["current"]), f"{fmt(d1['lo'])}~{fmt(d1['hi'])}", f"{gap:+.1f}%", pos])
+    await ctx.send("🔮 **明日最低價預估**（均值回歸通道）\n```\n" + table(rows)[:1800] + "\n```\n"
+                   + dstamp(snap) + " · 預估產生 " + fc.get("generated", ""))
+
+
 @bot.command(brief="設定鑰匙訊號推播頻道",
              description="訊號變動（深跌/補貨/高價/觀望）才推播到該頻道。\n需「管理頻道」權限；不帶參數＝設在當前頻道。\n例: !setalert #市場警報")
 @commands.has_permissions(manage_channels=True)

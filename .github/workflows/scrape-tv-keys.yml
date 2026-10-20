@@ -1,12 +1,12 @@
-name: scrape-tv-keys
-# 爬蟲放 GitHub（public repo 免費無限），bot 放 GCP 小機用 git pull 同步
+﻿name: scrape-tv-keys
+# ?祈??GitHub嚗ublic repo ?祥?⊿?嚗?bot ??GCP 撠???git pull ?郊
 on:
   schedule:
-    - cron: "*/5 * * * *"  # GitHub 最短 5 分鐘
+    - cron: "*/5 * * * *"  # GitHub ???5 ??
   workflow_dispatch:
     inputs:
       minor:
-        description: "指定小分類 ID（只抓它，例 40505；留空=全套）"
+        description: "??撠?憿?ID嚗??嚗? 40505嚗?蝛??典?嚗?
         required: false
         default: ""
 
