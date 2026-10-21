@@ -356,6 +356,17 @@ class MainActivity : Activity() {
             setPadding(48, 80, 48, 24)
         }
         ll.addView(TextView(this).apply { text = "ABI 價格回報"; textSize = 22f })
+        ll.addView(TextView(this).apply {
+            val v = try {
+                packageManager.getPackageInfo(packageName, 0).versionName
+            } catch (e: Exception) {
+                "?"
+            }
+            text = "版本 v$v　·　多分類抓取"
+            textSize = 12f
+            setTextColor(0xFF666666.toInt())
+            setPadding(0, 4, 0, 8)
+        })
         ll.addView(status)
         ll.addView(patInput)
 

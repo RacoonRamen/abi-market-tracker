@@ -49,6 +49,7 @@ CFG = os.path.join(HERE, "bot_config.json")
 CHART_DIR = os.path.join(HERE, "charts")
 TV_MINOR = "40505"
 TV_CSV = os.path.join(HERE, "tv_keys.csv")
+PRICES = os.path.join(HERE, "prices_all_full.csv")
 PHONE_JSON = os.path.join(HERE, "phone_prices.json")
 _price_cache = {"mtime": 0.0, "ts": None}
 _phone_cache = {"mtime": 0.0, "data": None}
@@ -76,6 +77,39 @@ def phone_time():
             tzinfo=timezone.utc).astimezone(TAIPEI)
     except Exception:
         return None
+
+
+def parse_utc(ts):
+    try:
+        return datetime.strptime(ts.strip(), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc).astimezone(TAIPEI)
+    except Exception:
+        return None
+
+
+def quote_time_for(minors):
+    """指定分類（可逗號分隔）的最新報價時間；有手機資料且涵蓋該分類時優先採手機"""
+    want = [m.strip() for m in str(minors).split(",") if m.strip()]
+    if not want:
+        return quote_source()
+    best = None
+    try:
+        with open(PRICES, encoding="utf-8-sig") as f:
+            for r in csv.DictReader(f):
+                if (r.get("minor") or "").strip() in want:
+                    ts = (r.get("fetched_at_utc") or "").strip()
+                    if ts and (best is None or ts > best[0]):
+                        best = (ts, parse_utc(ts))
+    except OSError:
+        pass
+    pt = best[1] if best else None
+    ph = phone_prices() or {}
+    ids = [str(i.get("id")) for i in ph.get("items", [])]
+    if ids and any(any(i.startswith(w) for w in want) for i in ids):
+        t = phone_time()
+        if t and (pt is None or t > pt):
+            return t, "手機"
+    return pt, "GitHub"
 
 
 def quote_source():
@@ -132,9 +166,9 @@ def fmt(n):
     return f"{n:,.0f}"
 
 
-def dstamp(snap):
+def dstamp(snap, minors=None):
     """只顯示真實報價時間與來源，避免和快照時間混淆"""
-    pt, src = quote_source()
+    pt, src = quote_time_for(minors) if minors else quote_source()
     if not pt:
         return "-# 尚無報價資料"
     age = int((datetime.now(TAIPEI) - pt).total_seconds() // 60)
@@ -610,16 +644,9 @@ async def _ensure_fresh(ctx, minor, label, timeout=75):
     回 True = 資料已是最新；False = 沿用上次資料（訊息會說明原因）"""
     def age_now():
         """依請求的分類判斷新鮮度（phone_prices 內是否已涵蓋這些 minor）"""
-        pt, src = quote_source()
+        pt, src = quote_time_for(minor or TV_MINOR)
         if not pt:
             return 1e9, None, src
-        want = [m.strip() for m in str(minor).split(",") if m.strip()] or [TV_MINOR]
-        d = phone_prices() or {}
-        ids = [str(i.get("id")) for i in d.get("items", [])]
-        if src == "手機":
-            covered = any(any(i.startswith(w) for w in want) for i in ids)
-            if not covered:
-                return 1e9, pt, src
         return (datetime.now(TAIPEI) - pt).total_seconds(), pt, src
 
     age, pt, src = age_now()
@@ -632,10 +659,18 @@ async def _ensure_fresh(ctx, minor, label, timeout=75):
             return True
         rid = await asyncio.to_thread(_request_phone, minor)
         if not rid:
+            grace = time.monotonic() + 15
+            while time.monotonic() < grace:
+                await asyncio.sleep(5)
+                await asyncio.to_thread(_pull)
+                age, pt, src = age_now()
+                if age <= FRESH_WINDOW:
+                    await asyncio.to_thread(_rebuild_models)
+                    return True
             age, pt, _ = age_now()
             how = "剛剛" if age < 60 else f"{int(age // 60)} 分鐘前"
-            await ctx.send(f"⚠ 無法通知手機（{LAST_PUT_ERR or _pat_ok()}）；"
-                           f"以下為 {how}的資料")
+            await ctx.send(f"⚠ 無法叫手機抓資料（{LAST_PUT_ERR or _pat_ok()}）；"
+                           f"以下是目前最新的 {how}資料")
             return False
         await ctx.send(f"📲 向手機要資料中（{label}）…")
         deadline = time.monotonic() + timeout
@@ -1062,12 +1097,12 @@ async def _top_misc(ctx, rarity, kind, color, n=20):
     try:
         path = top_table_png(pool[:n], os.path.join(CHART_DIR, f"top_misc_{'all' if rarity is None else int(rarity)}.png"),
                              title=f"{label}賣出推薦 Top{n}")
-        await ctx.send(f"📦 **{label}賣出推薦 Top{n}**（資料更新於 {snap.get('generated', '')}）",
+        await ctx.send(f"📦 **{label}賣出推薦 Top{n}**\n{dstamp(snap, MISC_MINORS)}",
                        file=discord.File(path))
     except Exception as e:
         print("top chart fail:", e)
         emb = discord.Embed(title=f"📦 {label}賣出推薦 Top{n}", description="\n".join(lines), color=color)
-        emb.set_footer(text=f"資料更新於 {snap.get('generated', '')}")
+        emb.set_footer(text=dstamp(snap, MISC_MINORS).replace('-# ', ''))
         await ctx.send(embed=emb)
 
 
