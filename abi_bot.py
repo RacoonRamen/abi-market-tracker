@@ -636,40 +636,6 @@ async def _ensure_fresh(ctx, minor, label, timeout=75):
         return False
 
 
-def _pat_ok():
-    """檢查 VM 的 PAT 是否有 Contents 讀寫權（用一個輕量 GET 判斷）"""
-    tok = _gh_token()
-    if not tok:
-        return "未設定"
-    try:
-        req = urllib.request.Request(
-            f"https://api.github.com/repos/{GH_REPO}/contents/phone_prices.json",
-            headers={"Authorization": f"Bearer {tok}", "User-Agent": "abi-bot",
-                     "Accept": "application/vnd.github+json"})
-        urllib.request.urlopen(req, timeout=10).read(1)
-        return "OK"
-    except urllib.error.HTTPError as e:
-        return {401: "token 無效", 403: "權限不足（缺 Contents）", 404: "OK"}.get(e.code, f"HTTP {e.code}")
-    except Exception as e:
-        return f"連線失敗（{type(e).__name__}）"
-
-
-@bot.command(name="status", brief="系統狀態（主機／資料來源／PAT）",
-             description="顯示 bot 主機、報價來源與資料年齡、VM PAT 狀態、上次抓取請求。\n例: !status")
-async def status_cmd(ctx):
-    pt, src = quote_source()
-    age = int((datetime.now(TAIPEI) - pt).total_seconds() // 60) if pt else -1
-    req = load_json(os.path.join(HERE, "scrape_request.json"), {}) or {}
-    lines = [
-        f"🖥 主機：GCP key-slave（bot 常駐）",
-        f"📊 報價來源：**{src}**" + (f"，{age} 分鐘前" if age >= 0 else "（無資料）"),
-        f"🔑 VM PAT：**{_pat_ok()}**",
-        f"📲 手機請求：`{req.get('id', '-')}`（minor {req.get('minor', '-')}）",
-        f"📁 快照：{load_json(SNAPSHOT, {}).get('generated', '-')}",
-    ]
-    await ctx.send("\n".join(lines))
-
-
 # ==================== Bot ====================
 class AbiBot(commands.Bot):
     def __init__(self):
@@ -859,6 +825,41 @@ async def on_ready():
 @bot.command(brief="存活檢查", description="回 pong，確認 bot 還活著。\n例: !ping")
 async def ping(ctx):
     await ctx.send("pong 🏓")
+
+
+def _pat_ok():
+    """檢查 VM 的 PAT 是否有 Contents 讀寫權（用一個輕量 GET 判斷）"""
+    tok = _gh_token()
+    if not tok:
+        return "未設定"
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{GH_REPO}/contents/phone_prices.json",
+            headers={"Authorization": f"Bearer {tok}", "User-Agent": "abi-bot",
+                     "Accept": "application/vnd.github+json"})
+        urllib.request.urlopen(req, timeout=10).read(1)
+        return "OK"
+    except urllib.error.HTTPError as e:
+        return {401: "token 無效", 403: "權限不足（缺 Contents）", 404: "OK"}.get(e.code, f"HTTP {e.code}")
+    except Exception as e:
+        return f"連線失敗（{type(e).__name__}）"
+
+
+@bot.command(name="status", brief="系統狀態（主機／資料來源／PAT）",
+             description="顯示 bot 主機、報價來源與資料年齡、VM PAT 狀態、上次抓取請求。\n例: !status")
+async def status_cmd(ctx):
+    pt, src = quote_source()
+    age = int((datetime.now(TAIPEI) - pt).total_seconds() // 60) if pt else -1
+    req = load_json(os.path.join(HERE, "scrape_request.json"), {}) or {}
+    lines = [
+        f"🖥 主機：GCP key-slave（bot 常駐）",
+        f"📊 報價來源：**{src}**" + (f"，{age} 分鐘前" if age >= 0 else "（無資料）"),
+        f"🔑 VM PAT：**{_pat_ok()}**",
+        f"📲 手機請求：`{req.get('id', '-')}`（minor {req.get('minor', '-')}）",
+        f"📁 快照：{load_json(SNAPSHOT, {}).get('generated', '-')}",
+    ]
+    await ctx.send("\n".join(lines))
+
 
 
 def best_pick(pool):
