@@ -150,7 +150,7 @@ def build_forecast(raw, cur=None, names=None, now=None):
         m = forecast_item(rows)
         if not m:
             continue
-        entry = {"name": names.get(iid, iid),
+        entry = {"id": iid, "name": names.get(iid, iid),
                  "current": cur.get(iid) or m["last"],
                  "mean": int(m["mean"]), "std": int(m["std"]),
                  "drift": int(m["slope"]),

@@ -37,12 +37,13 @@ private val EXTRACT_JS = """
   var out=[];
   for(var i=0;i<cards.length;i++){
     var c=cards[i], n=c.querySelector('.market-item-name');
-    var v=c.querySelector('.market-item-lowest-value'), q=c.querySelector('.market-item-count');
+    var v=c.querySelector('.market-item-lowest-value');
+    var q=c.querySelector('.market-item-count') || c.querySelector('.market-item-total-count') || c.querySelector('.market-item-stock');
     var t=v?v.textContent.trim():'';
     if(!/\d/.test(t)) continue;
     out.push({id:Number(c.dataset.itemId),
               name:n?(n.getAttribute('title')||n.textContent.trim()):'',
-              low:t, count:q?q.textContent.trim():''});
+              low:t, count:(q&&q.textContent.trim())?q.textContent.trim():((c.textContent||'').match(/在售\s*([\d,]+)/)||[])[1]||''});
   }
   return JSON.stringify(out);
 })()
@@ -92,7 +93,7 @@ object Scrape {
         fun step(i: Int) {
             if (i >= minors.size) {
                 if (all.length() == 0) { cb("沒有解析到任何價格"); return }
-                upload(ctx, all, reqId) { msg -> cb(msg) }
+                upload(ctx, all, reqId, minors.joinToString(",")) { msg -> cb(msg) }
                 return
             }
             scrapeOne(ctx, minors[i]) { arr ->
@@ -141,15 +142,58 @@ object Scrape {
             override fun onPageFinished(view: WebView?, url: String?) { poll() }
         }
 
+        val merged = JSONObject()
+        var prevSig = ""
+        var stable = 0
+
+        fun mergeInto(arr: JSONArray) {
+            for (k in 0 until arr.length()) {
+                val o = arr.optJSONObject(k) ?: continue
+                val id = o.optString("id")
+                if (id.isEmpty()) continue
+                val low = o.optString("low").filter { it.isDigit() }.toLongOrNull() ?: 0L
+                if (low <= 0L) continue
+                val oldLow = merged.optJSONObject(id)?.optString("low")
+                    ?.filter { it.isDigit() }?.toLongOrNull() ?: Long.MAX_VALUE
+                if (low < oldLow) merged.put(id, o)
+            }
+        }
+
+        fun mergedArray(): JSONArray {
+            val out = JSONArray()
+            val keys = merged.keys()
+            while (keys.hasNext()) out.put(merged.getJSONObject(keys.next()))
+            return out
+        }
+
+        fun signature(): String {
+            val ids = ArrayList<String>()
+            val keys = merged.keys()
+            while (keys.hasNext()) ids.add(keys.next())
+            ids.sort()
+            val sb = StringBuilder()
+            for (id in ids) {
+                sb.append(id).append(':').append(merged.getJSONObject(id).optString("low")).append(';')
+            }
+            return sb.toString()
+        }
+
         fun startPoll() {
             if (done) return
             tries++
-            if (tries > 40) { finish(null); return }
+            if (tries > 45) {
+                finish(if (merged.length() > 0) mergedArray() else null)
+                return
+            }
             web.evaluateJavascript(EXTRACT_JS) { raw ->
                 if (done) return@evaluateJavascript
                 val arr = parse(raw)
-                if (arr != null && arr.length() > 0) finish(arr)
-                else handler.postDelayed({ startPoll() }, 800)
+                if (arr != null) mergeInto(arr)
+                val sig = signature()
+                if (merged.length() > 0 && sig == prevSig) stable++ else stable = 0
+                prevSig = sig
+                if (merged.length() > 0 && stable >= 2) finish(mergedArray())
+                else handler.postDelayed({ startPoll() }, 900)
             }
         }
 
@@ -172,7 +216,7 @@ object Scrape {
     private fun digits(s: String?): Long =
         (s ?: "").filter { it.isDigit() }.toLongOrNull() ?: 0L
 
-    private fun upload(ctx: Context, arr: JSONArray, reqId: Long, cb: (String) -> Unit) {
+    private fun upload(ctx: Context, arr: JSONArray, reqId: Long, minorLabel: String, cb: (String) -> Unit) {
         val p = pat(ctx)
         if (p.isEmpty()) { cb("缺少 GitHub PAT"); return }
 
@@ -195,7 +239,7 @@ object Scrape {
                 .apply { timeZone = TimeZone.getTimeZone("UTC") }.format(Date())
             val payload = JSONObject().apply {
                 put("fetched_at", ts)
-                put("minor", "40505")
+                put("minor", minorLabel)
                 put("source", "android-app")
                 put("req", reqId)
                 put("items", items)

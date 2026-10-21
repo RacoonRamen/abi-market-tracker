@@ -1230,16 +1230,18 @@ def forecast_rows(fc, band, ids=None):
     return sorted(rows, key=lambda e: e["current"] / max(1, e[band]["center"]))
 
 
-def forecast_caption(fc, items, band, period_label):
+def forecast_caption(fc, items, band, period_label, cur_time=None, cur_src=None, cur_map=None):
     """圖片用的白話說明"""
     tgt = fc.get("target_label" if band == "d1" else "week_target_label", "")
     lines = [f"🔮 **{tgt} 電視台鑰匙{period_label}預估**"]
+    cur_map = cur_map or {}
     for e in items[:5]:
         b = e[band]
-        chg = (b["center"] / e["current"] - 1) * 100
+        cur = cur_map.get(str(e.get("id")), e["current"])
+        chg = (b["center"] / max(1, cur) - 1) * 100
         arrow = "⬇️" if chg < 0 else ("⬆️" if chg > 1 else "➡️")
         tail = ""
-        if e["current"] <= b["lo"]:
+        if cur <= b["lo"]:
             tail = "　⭐現價已低於預估，可以進"
         elif chg < -10:
             tail = "　⏳等跌"
@@ -1255,8 +1257,14 @@ def forecast_caption(fc, items, band, period_label):
                    max(e.get("w_to", "") for e in items),
                    max(e.get("w_n", 0) for e in items))
         basis = f"{f} ~ {t}（{n} 週每週最低價）"
-    lines.append(f"-# 依據 {basis} · 預估於 {fc.get('generated', '')}"
-                 f" · 金帶=預估區間, 綠點=通道內, 紅點=偏離")
+    lines.append(f"-# 依據 {basis} · 預估於 {fc.get('generated', '')}")
+    if cur_time:
+        lines.append(f"-# 現價時間 {cur_time.strftime('%m-%d %H:%M')}"
+                     f"（{cur_src}）· 目標 {tgt}")
+    today = datetime.now(TAIPEI).strftime("%Y-%m-%d")
+    if t and t < today:
+        lines.append(f"-# ⚠ 歷史只到 {t}，今日（{today[5:]}）尚未納入模型")
+    lines.append("-# 金帶=預估區間, 綠點=通道內, 紅點=偏離")
     return "\n".join(lines)
 
 
@@ -1265,6 +1273,7 @@ async def _send_forecast(ctx, band, period_label, fname):
     fc = load_json(os.path.join(HERE, "forecast.json"), {}) or {}
     # 用 history.json + 目前報價即時重算，避免 forecast.json 放久變舊
     tv_ids = None
+    cur, names = {}, {}
     try:
         hist = load_json(HISTORY, {}) or {}
         snap = bot.snapshot()
@@ -1299,7 +1308,8 @@ async def _send_forecast(ctx, band, period_label, fname):
     items = forecast_rows(fc, band, tv_ids)
     if not items:
         await ctx.send("還沒有預估資料 (forecast.json 缺失或該模型資料不足)"); return
-    caption = forecast_caption(fc, items, band, period_label)
+    cur_t, cur_src = quote_time_for(TV_MINOR)
+    caption = forecast_caption(fc, items, band, period_label, cur_t, cur_src, cur)
     chart_rows = [(e["name"], e["current"], e[band]["lo"], e[band]["hi"], e[band]["center"])
                   for e in items]
     os.makedirs(CHART_DIR, exist_ok=True)
