@@ -532,7 +532,7 @@ def _pull():
         print("pull fail:", e)
 
 
-FRESH_WINDOW = 180  # 秒：資料在這個時間內視為新鮮，直接回覆不吵手機
+FRESH_WINDOW = 300  # 秒：5 分鐘內視為新鮮，直接回覆不吵手機
 _fresh_lock = asyncio.Lock()
 
 
@@ -617,7 +617,10 @@ async def _ensure_fresh(ctx, minor, label, timeout=75):
             return True
         rid = await asyncio.to_thread(_request_phone, minor)
         if not rid:
-            await ctx.send("⚠ VM 的 PAT 缺少 `Contents: Read and write`，無法通知手機；以下是上次資料")
+            age, pt, _ = age_now()
+            how = "剛剛" if age < 60 else f"{int(age // 60)} 分鐘前"
+            await ctx.send(f"⚠ 無法通知手機（VM 的 PAT 缺 `Contents: Read and write`）；"
+                           f"以下為 {how}的資料")
             return False
         await ctx.send(f"📲 向手機要資料中（{label}）…")
         deadline = time.monotonic() + timeout
@@ -631,6 +634,40 @@ async def _ensure_fresh(ctx, minor, label, timeout=75):
                 return True
         await ctx.send("⚠ 手機 75 秒內沒有回報（App 是否還在待命？）以下是上次資料")
         return False
+
+
+def _pat_ok():
+    """檢查 VM 的 PAT 是否有 Contents 讀寫權（用一個輕量 GET 判斷）"""
+    tok = _gh_token()
+    if not tok:
+        return "未設定"
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{GH_REPO}/contents/phone_prices.json",
+            headers={"Authorization": f"Bearer {tok}", "User-Agent": "abi-bot",
+                     "Accept": "application/vnd.github+json"})
+        urllib.request.urlopen(req, timeout=10).read(1)
+        return "OK"
+    except urllib.error.HTTPError as e:
+        return {401: "token 無效", 403: "權限不足（缺 Contents）", 404: "OK"}.get(e.code, f"HTTP {e.code}")
+    except Exception as e:
+        return f"連線失敗（{type(e).__name__}）"
+
+
+@bot.command(name="status", brief="系統狀態（主機／資料來源／PAT）",
+             description="顯示 bot 主機、報價來源與資料年齡、VM PAT 狀態、上次抓取請求。\n例: !status")
+async def status_cmd(ctx):
+    pt, src = quote_source()
+    age = int((datetime.now(TAIPEI) - pt).total_seconds() // 60) if pt else -1
+    req = load_json(os.path.join(HERE, "scrape_request.json"), {}) or {}
+    lines = [
+        f"🖥 主機：GCP key-slave（bot 常駐）",
+        f"📊 報價來源：**{src}**" + (f"，{age} 分鐘前" if age >= 0 else "（無資料）"),
+        f"🔑 VM PAT：**{_pat_ok()}**",
+        f"📲 手機請求：`{req.get('id', '-')}`（minor {req.get('minor', '-')}）",
+        f"📁 快照：{load_json(SNAPSHOT, {}).get('generated', '-')}",
+    ]
+    await ctx.send("\n".join(lines))
 
 
 # ==================== Bot ====================
