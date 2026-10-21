@@ -131,10 +131,10 @@ def fmt(n):
 
 
 def dstamp(snap):
-    """標示真實報價時間 (取 tv_keys 與手機上傳的最新) + 快照產生時間; 太舊自動加警語"""
+    """只顯示真實報價時間與來源，避免和快照時間混淆"""
     pt, src = quote_source()
     if not pt:
-        return f"-# ⚠ 找不到報價時間 · 快照 {snap.get('generated', '')}"
+        return "-# 尚無報價資料"
     age = int((datetime.now(TAIPEI) - pt).total_seconds() // 60)
     if age < 120:
         ago = f"{age} 分鐘前"
@@ -143,9 +143,7 @@ def dstamp(snap):
     else:
         ago = f"{age // 1440} 天前"
     warn = "⚠ 報價已停止更新　" if age >= 20 else ""
-    snap_gen = snap.get("generated", "")
-    snap_txt = "" if snap_gen.startswith(pt.strftime("%Y-%m-%d %H:%M")) else f" · 快照 {snap_gen}"
-    return (f"-# {warn}報價時間 {pt.strftime('%m-%d %H:%M')}（{ago}，來源 {src}）{snap_txt}")
+    return f"-# {warn}報價時間 {pt.strftime('%m-%d %H:%M')}（{ago}，來源 {src}）"
 
 
 def dwidth(s):
@@ -532,24 +530,39 @@ def _pull():
         print("pull fail:", e)
 
 
-async def _ensure_fresh(ctx, minor, label, timeout=120):
-    """按需求抓：寫請求檔 → 手機 App 20 秒內看到 → 抓完上傳 → 這裡等到資料變新
-    回 True 表示資料已更新；False 表示沿用舊資料"""
-    before = phone_time()
-    rid = await asyncio.to_thread(_request_phone, minor)
-    if not rid:
-        await ctx.send("⚠ 無法送出抓取請求（VM 的 PAT 需要 `Contents: Read and write`）")
-        return False
-    await ctx.send(f"📲 已通知手機抓取{label}（約 20~60 秒）…")
-    deadline = time.monotonic() + max(40, timeout)
-    while time.monotonic() < deadline:
-        await asyncio.sleep(6)
-        await asyncio.to_thread(_pull)
-        pt = phone_time()
-        if pt and (before is None or pt > before):
+FRESH_WINDOW = 180  # 秒：資料在這個時間內視為新鮮，直接回覆不吵手機
+_fresh_lock = asyncio.Lock()
+
+
+async def _ensure_fresh(ctx, minor, label, timeout=75):
+    """資料新鮮就秒回；否則請手機 App 抓一次並等它上傳。
+    回 True = 資料已是最新；False = 沿用上次資料（訊息會說明原因）"""
+    def age_now():
+        pt, src = quote_source()
+        return ((datetime.now(TAIPEI) - pt).total_seconds() if pt else 1e9), pt, src
+
+    age, pt, src = age_now()
+    if age <= FRESH_WINDOW:
+        return True
+
+    async with _fresh_lock:
+        age, pt, src = age_now()
+        if age <= FRESH_WINDOW:
             return True
-    await ctx.send("⏳ 手機沒有回報（App 是否在執行？先用上次資料）")
-    return False
+        rid = await asyncio.to_thread(_request_phone, minor)
+        if not rid:
+            await ctx.send("⚠ VM 的 PAT 缺少 `Contents: Read and write`，無法通知手機；以下是上次資料")
+            return False
+        await ctx.send(f"📲 向手機要資料中（{label}）…")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(5)
+            await asyncio.to_thread(_pull)
+            age, pt, src = age_now()
+            if age <= 60:
+                return True
+        await ctx.send("⚠ 手機 75 秒內沒有回報（App 是否還在待命？）以下是上次資料")
+        return False
 
 
 # ==================== Bot ====================
@@ -665,14 +678,14 @@ def daily_brief_text(snap):
     tv.sort(key=lambda i: i["low"] / i["buy_price"])
     now = datetime.now(TAIPEI)
     head = "☀️ **早報**" if now.hour < 12 else "🌙 **晚間快報**"
-    pt = price_time()
+    pt, src = quote_source()
     if pt:
         age = int((now - pt).total_seconds() // 60)
         ago = f"{age} 分鐘前" if age < 120 else (
             f"{age // 60} 小時前" if age < 2880 else f"{age // 1440} 天前")
         warn = "　⚠ 報價已停止更新" if age >= 20 else ""
         lines = [f"{head} {now.strftime('%H:%M')}　報價 {pt.strftime('%m-%d %H:%M')}"
-                 f"（{ago}）{warn}", ""]
+                 f"（{ago}，來源 {src}）{warn}", ""]
     else:
         lines = [f"{head} {now.strftime('%H:%M')}", ""]
 
