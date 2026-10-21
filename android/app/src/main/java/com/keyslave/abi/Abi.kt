@@ -12,6 +12,7 @@ import android.net.Uri
 import android.os.*
 import android.provider.Settings
 import android.view.Gravity
+import android.view.WindowManager
 import android.view.ViewGroup
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -73,6 +74,7 @@ object Scrape {
         var done = false
         val handler = Handler(Looper.getMainLooper())
         var tries = 0
+        lateinit var poll: () -> Unit
 
         fun finish(msg: String) {
             if (done) return
@@ -86,7 +88,7 @@ object Scrape {
             override fun onPageFinished(view: WebView?, url: String?) { poll() }
         }
 
-        fun poll() {
+        fun startPoll() {
             if (done) return
             tries++
             if (tries > 60) { finish("逾時：頁面沒出現價格（可能被擋或載入太慢）"); return }
@@ -96,10 +98,12 @@ object Scrape {
                 if (arr != null && arr.length() > 0) {
                     upload(ctx, arr) { msg -> finish(msg) }
                 } else {
-                    handler.postDelayed({ poll() }, 800)
+                    handler.postDelayed({ startPoll() }, 800)
                 }
             }
         }
+
+        poll = { startPoll() }
 
         handler.postDelayed({ web.loadUrl(MARKET_URL) }, 300)
         handler.postDelayed({ if (!done) finish("逾時 90 秒") }, 90_000)
@@ -260,7 +264,11 @@ class PriceService : Service() {
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent?) {
         if (intent?.action == Intent.ACTION_BOOT_COMPLETED) {
-            ctx.startForegroundService(Intent(ctx, PriceService::class.java))
+            try {
+                ctx.startForegroundService(Intent(ctx, PriceService::class.java))
+            } catch (_: Exception) {
+                // Android 15+ 對開機啟動前景服務有限制；開 App 一次即可恢復
+            }
         }
     }
 }
