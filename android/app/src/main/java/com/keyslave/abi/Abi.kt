@@ -96,9 +96,12 @@ object Scrape {
                 return
             }
             scrapeOne(ctx, minors[i]) { arr ->
-                if (arr == null) { cb("逾時：${minors[i]} 沒出現價格"); return }
-                for (k in 0 until arr.length()) all.put(arr.getJSONObject(k))
-                step(i + 1)
+                if (arr == null) {
+                    cb("逾時：${minors[i]} 沒出現價格")
+                } else {
+                    for (k in 0 until arr.length()) all.put(arr.getJSONObject(k))
+                    step(i + 1)
+                }
             }
         }
         step(0)
