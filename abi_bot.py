@@ -828,25 +828,24 @@ async def ping(ctx):
 
 
 def _pat_ok():
-    """檢查 VM 的 PAT 是否有 Contents 讀寫權（用一個輕量 GET 判斷）"""
+    """檢查 VM 的 PAT 是否有 Contents 讀寫權（看 repo 的 push 權限）"""
     tok = _gh_token()
     if not tok:
         return "未設定"
     try:
         req = urllib.request.Request(
-            f"https://api.github.com/repos/{GH_REPO}/contents/phone_prices.json",
+            f"https://api.github.com/repos/{GH_REPO}",
             headers={"Authorization": f"Bearer {tok}", "User-Agent": "abi-bot",
                      "Accept": "application/vnd.github+json"})
-        urllib.request.urlopen(req, timeout=10).read(1)
-        return "OK"
+        d = json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
+        perms = d.get("permissions") or {}
+        if not perms.get("push"):
+            return "唯讀（缺 Contents: Read and write）"
+        return "OK（可讀寫）"
     except urllib.error.HTTPError as e:
-        return {401: "token 無效", 403: "權限不足（缺 Contents）", 404: "OK"}.get(e.code, f"HTTP {e.code}")
+        return {401: "token 無效", 403: "權限不足", 404: "repo 不存在"}.get(e.code, f"HTTP {e.code}")
     except Exception as e:
         return f"連線失敗（{type(e).__name__}）"
-
-
-@bot.command(name="status", brief="系統狀態（主機／資料來源／PAT）",
-             description="顯示 bot 主機、報價來源與資料年齡、VM PAT 狀態、上次抓取請求。\n例: !status")
 async def status_cmd(ctx):
     pt, src = quote_source()
     age = int((datetime.now(TAIPEI) - pt).total_seconds() // 60) if pt else -1
