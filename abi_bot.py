@@ -481,10 +481,15 @@ def _gh_token():
         return None
 
 
+LAST_PUT_ERR = None
+
+
 def _put_repo_file(name, text, message):
     """用 PAT 寫檔到 repo（需要 Contents: Read and write）；回 True/False"""
+    global LAST_PUT_ERR
     tok = _gh_token()
     if not tok:
+        LAST_PUT_ERR = "PAT 未設定"
         return False
     base = f"https://api.github.com/repos/{GH_REPO}/contents/{name}"
     sha = None
@@ -510,9 +515,19 @@ def _put_repo_file(name, text, message):
                                               "Content-Type": "application/json",
                                               "User-Agent": "abi-bot"})
         with urllib.request.urlopen(req, timeout=20) as r:
+            LAST_PUT_ERR = None
             return 200 <= r.status < 300
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode()).get("message", "")
+        except Exception:
+            msg = ""
+        LAST_PUT_ERR = f"HTTP {e.code}" + (f"：{msg}" if msg else "")
+        print("put file fail:", LAST_PUT_ERR)
+        return False
     except Exception as e:
-        print("put file fail:", e)
+        LAST_PUT_ERR = f"{type(e).__name__}: {e}"
+        print("put file fail:", LAST_PUT_ERR)
         return False
 
 
@@ -619,7 +634,7 @@ async def _ensure_fresh(ctx, minor, label, timeout=75):
         if not rid:
             age, pt, _ = age_now()
             how = "剛剛" if age < 60 else f"{int(age // 60)} 分鐘前"
-            await ctx.send(f"⚠ 無法通知手機（VM 的 PAT 缺 `Contents: Read and write`）；"
+            await ctx.send(f"⚠ 無法通知手機（{LAST_PUT_ERR or _pat_ok()}）；"
                            f"以下為 {how}的資料")
             return False
         await ctx.send(f"📲 向手機要資料中（{label}）…")
@@ -853,7 +868,7 @@ async def status_cmd(ctx):
     lines = [
         f"🖥 主機：GCP key-slave（bot 常駐）",
         f"📊 報價來源：**{src}**" + (f"，{age} 分鐘前" if age >= 0 else "（無資料）"),
-        f"🔑 VM PAT：**{_pat_ok()}**",
+        f"🔑 VM PAT：**{_pat_ok()}**" + (f"（上次寫入失敗：{LAST_PUT_ERR}）" if LAST_PUT_ERR else ""),
         f"📲 手機請求：`{req.get('id', '-')}`（minor {req.get('minor', '-')}）",
         f"📁 快照：{load_json(SNAPSHOT, {}).get('generated', '-')}",
     ]
