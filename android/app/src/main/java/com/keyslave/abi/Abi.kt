@@ -573,7 +573,15 @@ class MainActivity : Activity() {
             if (id > 0 && id == pendingDl) {
                 pendingDl = -1L
                 val ok = Updater.install(this@MainActivity, id)
-                status.text = if (ok) "狀態：開始安裝…" else "狀態：請允許安裝未知來源後再按一次更新"
+                if (ok) {
+                    getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                        .remove("dlId").apply()
+                    status.text = "狀態：開始安裝…"
+                } else {
+                    getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                        .putLong("dlId", id).apply()
+                    status.text = "狀態：請允許安裝未知來源，回來後會自動安裝"
+                }
             }
         }
     }
@@ -600,6 +608,15 @@ class MainActivity : Activity() {
                 updateBtn.text = "檢查更新"
                 if (manual) status.text = "狀態：已是最新版 v$cur"
             }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val id = getSharedPreferences(PREFS, MODE_PRIVATE).getLong("dlId", -1L)
+        if (id > 0L && Updater.install(this, id)) {
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove("dlId").apply()
+            status.text = "狀態：開始安裝…"
         }
     }
 
