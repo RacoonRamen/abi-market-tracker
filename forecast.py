@@ -65,6 +65,49 @@ def parse_week_rows(rows):
     return out
 
 
+def _parse_iso(s):
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def load_current(tv_csv, phone_json=None):
+    """現價：tv_keys.csv 當底，phone_prices.json 較新時覆蓋（手機是主要即時來源）"""
+    cur = {}
+    csv_time = None
+    try:
+        import csv as _csv
+        with open(tv_csv, encoding="utf-8-sig") as f:
+            seen = {}
+            for r in _csv.DictReader(f):
+                seen[r["item_id"]] = r
+                t = _parse_iso(r.get("fetched_at_utc"))
+                if t and (csv_time is None or t > csv_time):
+                    csv_time = t
+            for iid, r in seen.items():
+                try:
+                    cur[iid] = int(float(str(r["lowest_price"]).replace(",", "").strip()))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
+        ph = json.load(open(phone_json, encoding="utf-8"))
+        pt = _parse_iso(ph.get("fetched_at"))
+        if pt and (csv_time is None or pt >= csv_time):
+            for it in ph.get("items", []):
+                try:
+                    low = int(it["low"])
+                    if low > 0:
+                        cur[str(it["id"])] = low
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return cur
+
+
 def forecast_item(day_rows, horizon=(1, 3, 7), slope_win=14):
     """回 {h: (center, lo, hi)} 與模型狀態"""
     if len(day_rows) < 10:
@@ -87,41 +130,11 @@ def forecast_item(day_rows, horizon=(1, 3, 7), slope_win=14):
             "last": lows[-1], "n": n}
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--history", default=os.path.join(HERE, "history.json"))
-    ap.add_argument("--tv-csv", default=os.path.join(HERE, "tv_keys.csv"))
-    ap.add_argument("--out", default=os.path.join(HERE, "forecast.json"))
-    args = ap.parse_args()
-
-    raw = json.load(open(args.history, encoding="utf-8"))
-    # 現價對照
-    cur = {}
-    try:
-        import csv as _csv
-        with open(args.tv_csv, encoding="utf-8") as f:
-            seen = {}
-            for r in _csv.DictReader(f):
-                seen[r["item_id"]] = r
-            for iid, r in seen.items():
-                try:
-                    cur[iid] = int(float(r["lowest_price"]))
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    names = {}
-    for iid, h in raw.items():
-        pass
-    # 名稱從 game_zhTW / items_index 都不一定有, 用 snapshot 的
-    try:
-        snap = json.load(open(os.path.join(HERE, "snapshot.json"), encoding="utf-8"))
-        names = {i["id"]: i["name"] for i in snap.get("items", [])}
-    except Exception:
-        pass
-
-    now = datetime.now(TAIPEI)
+def build_forecast(raw, cur=None, names=None, now=None):
+    """由 history.json 內容計算預估；cur = {item_id: 現價}，now 可指定基準時間"""
+    cur = cur or {}
+    names = names or {}
+    now = now or datetime.now(TAIPEI)
     tgt = now + timedelta(days=1)
     wd = "一二三四五六日"[tgt.weekday()]
     wtgt = now + timedelta(days=7)
@@ -157,7 +170,30 @@ def main():
                            else ("low-band" if cur.get(iid) and cur[iid] < entry["d1"]["center"]
                                  else "in-band"))
         out["items"][iid] = entry
+    return out
 
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--history", default=os.path.join(HERE, "history.json"))
+    ap.add_argument("--tv-csv", default=os.path.join(HERE, "tv_keys.csv"))
+    ap.add_argument("--phone", default=os.path.join(HERE, "phone_prices.json"))
+    ap.add_argument("--out", default=os.path.join(HERE, "forecast.json"))
+    args = ap.parse_args()
+
+    raw = json.load(open(args.history, encoding="utf-8"))
+
+    # 名稱與現價基底從 snapshot 來，再用 tv_keys / 手機較新的報價覆蓋
+    names, cur = {}, {}
+    try:
+        snap = json.load(open(os.path.join(HERE, "snapshot.json"), encoding="utf-8"))
+        names = {i["id"]: i["name"] for i in snap.get("items", [])}
+        cur = {str(i["id"]): int(i["low"]) for i in snap.get("items", []) if i.get("low")}
+    except Exception:
+        pass
+    cur.update(load_current(args.tv_csv, args.phone))
+
+    out = build_forecast(raw, cur, names)
     json.dump(out, open(args.out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     print(f"OK {args.out}: {len(out['items'])} items")
     # 主控台摘要
