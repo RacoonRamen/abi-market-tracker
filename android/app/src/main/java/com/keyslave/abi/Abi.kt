@@ -6,14 +6,12 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.graphics.Color
 import android.graphics.PixelFormat
 import android.net.Uri
 import android.os.*
 import android.provider.Settings
 import android.view.Gravity
 import android.view.WindowManager
-import android.view.ViewGroup
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.*
@@ -53,8 +51,40 @@ private val EXTRACT_JS = """
 object Scrape {
     fun hasOverlay(ctx: Context) = Settings.canDrawOverlays(ctx)
 
-    /** 在背景用 1px 的 WebView 載入市場頁並抓取；callback 在主執行緒 */
-    fun run(ctx: Context, cb: (String) -> Unit) {
+    private fun pat(ctx: Context) =
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("pat", "")?.trim().orEmpty()
+
+    private fun api(pat: String, path: String): HttpURLConnection {
+        val c = URL("https://api.github.com/repos/$REPO/$path").openConnection() as HttpURLConnection
+        c.setRequestProperty("Authorization", "Bearer $pat")
+        c.setRequestProperty("Accept", "application/vnd.github+json")
+        c.setRequestProperty("User-Agent", "abi-price-app")
+        c.connectTimeout = 15000
+        c.readTimeout = 15000
+        return c
+    }
+
+    /** 讀 scrape_request.json 的 id；沒有或失敗回 null */
+    fun fetchRequest(ctx: Context): Long? {
+        val p = pat(ctx)
+        if (p.isEmpty()) return null
+        val c = api(p, "contents/scrape_request.json").apply {
+            setRequestProperty("Accept", "application/vnd.github.raw")
+        }
+        return try {
+            if (c.responseCode == 200) {
+                val t = BufferedReader(InputStreamReader(c.inputStream)).readText()
+                JSONObject(t).optLong("id", 0L).takeIf { it > 0 }
+            } else null
+        } catch (_: Exception) {
+            null
+        } finally {
+            c.disconnect()
+        }
+    }
+
+    /** 背景用 1px WebView 抓價；callback 在主執行緒 */
+    fun run(ctx: Context, reqId: Long, cb: (String) -> Unit) {
         if (!hasOverlay(ctx)) { cb("缺少「顯示在其他應用程式上層」權限"); return }
         val wm = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
         val web = WebView(ctx)
@@ -72,8 +102,8 @@ object Scrape {
         try { wm.addView(web, lp) } catch (e: Exception) { cb("懸浮窗建立失敗: ${e.message}"); return }
 
         var done = false
-        val handler = Handler(Looper.getMainLooper())
         var tries = 0
+        val handler = Handler(Looper.getMainLooper())
         lateinit var poll: () -> Unit
 
         fun finish(msg: String) {
@@ -91,12 +121,12 @@ object Scrape {
         fun startPoll() {
             if (done) return
             tries++
-            if (tries > 60) { finish("逾時：頁面沒出現價格（可能被擋或載入太慢）"); return }
+            if (tries > 60) { finish("逾時：頁面沒出現價格"); return }
             web.evaluateJavascript(EXTRACT_JS) { raw ->
                 if (done) return@evaluateJavascript
                 val arr = parse(raw)
                 if (arr != null && arr.length() > 0) {
-                    upload(ctx, arr) { msg -> finish(msg) }
+                    upload(ctx, arr, reqId) { msg -> finish(msg) }
                 } else {
                     handler.postDelayed({ startPoll() }, 800)
                 }
@@ -104,7 +134,6 @@ object Scrape {
         }
 
         poll = { startPoll() }
-
         handler.postDelayed({ web.loadUrl(MARKET_URL) }, 300)
         handler.postDelayed({ if (!done) finish("逾時 90 秒") }, 90_000)
     }
@@ -121,10 +150,9 @@ object Scrape {
     private fun digits(s: String?): Long =
         (s ?: "").filter { it.isDigit() }.toLongOrNull() ?: 0L
 
-    private fun upload(ctx: Context, arr: JSONArray, cb: (String) -> Unit) {
-        val pat = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getString("pat", "")?.trim().orEmpty()
-        if (pat.isEmpty()) { cb("缺少 GitHub PAT，請先在 App 內設定"); return }
+    private fun upload(ctx: Context, arr: JSONArray, reqId: Long, cb: (String) -> Unit) {
+        val p = pat(ctx)
+        if (p.isEmpty()) { cb("缺少 GitHub PAT"); return }
 
         Thread {
             val items = JSONArray()
@@ -147,22 +175,16 @@ object Scrape {
                 put("fetched_at", ts)
                 put("minor", "40505")
                 put("source", "android-app")
+                put("req", reqId)
                 put("items", items)
             }
-            val msg = try { putFile(pat, "phone_prices.json", payload.toString(1), "phone prices $ts") }
-                      catch (e: Exception) { "上傳失敗: ${e.message}" }
+            val msg = try {
+                putFile(p, "phone_prices.json", payload.toString(1), "phone prices $ts (req $reqId)")
+            } catch (e: Exception) {
+                "上傳失敗: ${e.message}"
+            }
             Handler(Looper.getMainLooper()).post { cb(msg) }
         }.start()
-    }
-
-    private fun api(pat: String, path: String): HttpURLConnection {
-        val c = URL("https://api.github.com/repos/$REPO/$path").openConnection() as HttpURLConnection
-        c.setRequestProperty("Authorization", "Bearer $pat")
-        c.setRequestProperty("Accept", "application/vnd.github+json")
-        c.setRequestProperty("User-Agent", "abi-price-app")
-        c.connectTimeout = 20000
-        c.readTimeout = 20000
-        return c
     }
 
     private fun putFile(pat: String, name: String, content: String, message: String): String {
@@ -196,28 +218,44 @@ object Scrape {
 class PriceService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var wake: PowerManager.WakeLock
+    private var busy = false
 
     override fun onCreate() {
         super.onCreate()
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "abi:scrape")
+        wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "abi:watch")
         wake.setReferenceCounted(false)
         wake.acquire()
-        startFg(notif("待命中"))
-        handler.postDelayed(loop, 3_000)
+        startFg(notif("等待 Discord 指令…"))
+        handler.postDelayed(tick, 4_000)
     }
 
-    private val loop = object : Runnable {
+    private val tick = object : Runnable {
         override fun run() {
-            Scrape.run(this@PriceService) { msg ->
-                notify(notif("$msg · ${nowText()}"))
+            if (!busy) {
+                Thread {
+                    val req = Scrape.fetchRequest(this@PriceService)
+                    val last = getSharedPreferences(PREFS, MODE_PRIVATE).getLong("lastReq", 0L)
+                    if (req != null && req > last) {
+                        busy = true
+                        handler.post {
+                            notify(notif("收到指令，抓取中…"))
+                            Scrape.run(this@PriceService, req) { msg ->
+                                getSharedPreferences(PREFS, MODE_PRIVATE)
+                                    .edit().putLong("lastReq", req).putString("last", msg).apply()
+                                notify(notif("$msg · ${nowText()}"))
+                                busy = false
+                            }
+                        }
+                    }
+                }.start()
             }
-            handler.postDelayed(this, 15 * 60_000L)
+            handler.postDelayed(this, 20_000)
         }
     }
 
     private fun nowText(): String =
-        SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date())
+        SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
 
     private fun notif(text: String): Notification {
         val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -248,7 +286,7 @@ class PriceService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startFg(notif("執行中 · ${nowText()}"))
+        startFg(notif("等待 Discord 指令…"))
         return START_STICKY
     }
 
@@ -267,7 +305,6 @@ class BootReceiver : BroadcastReceiver() {
             try {
                 ctx.startForegroundService(Intent(ctx, PriceService::class.java))
             } catch (_: Exception) {
-                // Android 15+ 對開機啟動前景服務有限制；開 App 一次即可恢復
             }
         }
     }
@@ -280,7 +317,6 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
-        val tv = TextView(this)
         status = TextView(this).apply {
             text = "狀態：${prefs.getString("last", "尚未執行")}"
             textSize = 14f
@@ -318,31 +354,31 @@ class MainActivity : Activity() {
             text = "立即抓取一次"
             setOnClickListener {
                 status.text = "狀態：抓取中…"
-                Scrape.run(this@MainActivity) { msg ->
+                Scrape.run(this@MainActivity, 0L) { msg ->
                     status.text = "狀態：$msg"
                     prefs.edit().putString("last", msg).apply()
                 }
             }
         })
         ll.addView(Button(this).apply {
-            text = "啟動背景服務"
+            text = "啟動監聽（Discord 指令觸發）"
             setOnClickListener {
                 if (Build.VERSION.SDK_INT >= 33) {
                     requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
                 }
                 startForegroundService(Intent(this@MainActivity, PriceService::class.java))
-                status.text = "狀態：背景服務已啟動（每 15 分鐘）"
+                status.text = "狀態：已啟動，等待 Discord 指令（每 20 秒檢查）"
             }
         })
         ll.addView(Button(this).apply {
-            text = "停止背景服務"
+            text = "停止"
             setOnClickListener {
                 stopService(Intent(this@MainActivity, PriceService::class.java))
-                status.text = "狀態：背景服務已停止"
+                status.text = "狀態：已停止"
             }
         })
         ll.addView(TextView(this).apply {
-            text = "說明：Android 限制背景排程最短 15 分鐘；需要懸浮窗權限才能用隱藏瀏覽器載入頁面。"
+            text = "說明：不再定時抓取。Discord 有指令時，bot 會在 repo 寫請求，App 20 秒內看到就抓一次並上傳。"
             textSize = 12f
             setPadding(0, 24, 0, 0)
         })

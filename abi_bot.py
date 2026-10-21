@@ -10,6 +10,7 @@
   !stopalert / !ping / !help
 """
 import asyncio
+import base64
 import csv
 import json
 import math
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -479,22 +481,48 @@ def _gh_token():
         return None
 
 
-def _dispatch(minor):
-    """觸發 GitHub 指定分類抓取（同步函式，呼叫方用 to_thread）"""
+def _put_repo_file(name, text, message):
+    """用 PAT 寫檔到 repo（需要 Contents: Read and write）；回 True/False"""
     tok = _gh_token()
     if not tok:
-        return "no-pat"
+        return False
+    base = f"https://api.github.com/repos/{GH_REPO}/contents/{name}"
+    sha = None
     try:
-        req = urllib.request.Request(
-            f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{GH_WORKFLOW}/dispatches",
-            data=json.dumps({"ref": "main", "inputs": {"minor": minor}}).encode(),
-            headers={"Accept": "application/vnd.github+json",
-                      "Authorization": f"Bearer {tok}"})
-        urllib.request.urlopen(req, timeout=15)
-        return "ok"
+        req = urllib.request.Request(base, headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {tok}", "User-Agent": "abi-bot"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            sha = json.loads(r.read().decode()).get("sha")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            print("get sha fail:", e)
     except Exception as e:
-        print("dispatch fail:", e)
-        return "fail"
+        print("get sha fail:", e)
+    body = {"message": message,
+            "content": base64.b64encode(text.encode()).decode()}
+    if sha:
+        body["sha"] = sha
+    try:
+        req = urllib.request.Request(base, data=json.dumps(body).encode(), method="PUT",
+                                     headers={"Accept": "application/vnd.github+json",
+                                              "Authorization": f"Bearer {tok}",
+                                              "Content-Type": "application/json",
+                                              "User-Agent": "abi-bot"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return 200 <= r.status < 300
+    except Exception as e:
+        print("put file fail:", e)
+        return False
+
+
+def _request_phone(minor):
+    """請手機 App 抓一次（寫 scrape_request.json，手機每 20 秒檢查）"""
+    rid = int(time.time())
+    ok = _put_repo_file("scrape_request.json",
+                        json.dumps({"id": rid, "minor": minor or TV_MINOR, "ts": rid}),
+                        f"scrape request {rid}")
+    return rid if ok else None
 
 
 def _pull():
@@ -504,32 +532,24 @@ def _pull():
         print("pull fail:", e)
 
 
-async def _ensure_fresh(ctx, minor, label, timeout=420):
-    """按需抓取：dispatch 指定分類→等 snapshot.json 更新。
-    成功回 True；拿不到（含3分鐘內剛按過）就用舊資料回 False。"""
-    global _last_dispatch
-    try:
-        old_mtime = os.path.getmtime(SNAPSHOT)
-    except OSError:
-        old_mtime = 0
-    now = time.monotonic()
-    if now - _last_dispatch >= 180:
-        st = await asyncio.to_thread(_dispatch, minor)
-        if st == "no-pat":
-            await ctx.send("⏳ 主機還沒放 PAT（`~/.github-pat`），先用舊資料"); return False
-        if st != "ok":
-            await ctx.send("⏳ 觸發失敗，先用舊資料"); return False
-        _last_dispatch = now
-        await ctx.send(f"🔄 正在重抓{label}（約 1~3 分鐘）…")
-    for _ in range(max(1, timeout // 20)):
-        await asyncio.sleep(20)
+async def _ensure_fresh(ctx, minor, label, timeout=120):
+    """按需求抓：寫請求檔 → 手機 App 20 秒內看到 → 抓完上傳 → 這裡等到資料變新
+    回 True 表示資料已更新；False 表示沿用舊資料"""
+    before = phone_time()
+    rid = await asyncio.to_thread(_request_phone, minor)
+    if not rid:
+        await ctx.send("⚠ 無法送出抓取請求（VM 的 PAT 需要 `Contents: Read and write`）")
+        return False
+    await ctx.send(f"📲 已通知手機抓取{label}（約 20~60 秒）…")
+    deadline = time.monotonic() + max(40, timeout)
+    while time.monotonic() < deadline:
+        await asyncio.sleep(6)
         await asyncio.to_thread(_pull)
-        try:
-            if os.path.getmtime(SNAPSHOT) != old_mtime:
-                return True
-        except OSError:
-            pass
-    await ctx.send("⏳ 抓取超時先用舊資料"); return False
+        pt = phone_time()
+        if pt and (before is None or pt > before):
+            return True
+    await ctx.send("⏳ 手機沒有回報（App 是否在執行？先用上次資料）")
+    return False
 
 
 # ==================== Bot ====================
