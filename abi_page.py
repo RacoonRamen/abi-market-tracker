@@ -808,9 +808,11 @@ def main():
                 h["vs_avg"] = (cur - m["safe_buy"]) / m["safe_buy"] * 100 if m["safe_buy"] else 0
     rows = load_latest_rows(args.csv)
     # 手機即時報價覆蓋（讓模型用最新價重算）
+    phone_data = None
     try:
         if args.phone and os.path.exists(args.phone):
             ph = json.load(open(args.phone, encoding="utf-8"))
+            phone_data = ph
             pmap = {str(i.get("id")): i for i in ph.get("items", [])}
             hit = 0
             for r in rows:
@@ -889,8 +891,17 @@ def main():
 
     cats = [{"minor": m, "name": cat_zh.get(m, name), "major": MINOR_TO_MAJOR.get(m, "?"), "n": n}
             for (m, name), n in cats_n.items()]
-    payload = {"generated": quote_stamp(args.hist)
-               or datetime.now(TAIPEI).strftime("%Y-%m-%d %H:%M 台北"),
+    gen = quote_stamp(args.hist)
+    try:
+        if phone_data:
+            t = datetime.strptime(phone_data["fetched_at"], "%Y-%m-%dT%H:%M:%SZ")
+            t = t.replace(tzinfo=timezone.utc).astimezone(TAIPEI)
+            ptxt = t.strftime("%Y-%m-%d %H:%M 台北")
+            if gen is None or ptxt > gen:
+                gen = ptxt
+    except Exception:
+        pass
+    payload = {"generated": gen or datetime.now(TAIPEI).strftime("%Y-%m-%d %H:%M 台北"),
                "majors": MAJORS, "cats": cats, "items": items,
                "tv_unlisted": tv_unlisted}
 
