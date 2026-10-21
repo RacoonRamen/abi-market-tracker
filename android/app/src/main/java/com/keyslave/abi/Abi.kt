@@ -3,12 +3,15 @@ package com.keyslave.abi
 import android.Manifest
 import android.app.*
 import android.content.BroadcastReceiver
+import android.content.IntentFilter
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
 import android.net.Uri
+import android.app.DownloadManager
 import android.os.*
+import android.os.Environment
 import android.provider.Settings
 import android.view.Gravity
 import android.view.WindowManager
@@ -377,9 +380,101 @@ class BootReceiver : BroadcastReceiver() {
     }
 }
 
+object Updater {
+    private const val APK_MIME = "application/vnd.android.package-archive"
+
+    fun currentVersion(ctx: Context): String = try {
+        ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: "0"
+    } catch (e: Exception) {
+        "0"
+    }
+
+    fun newer(remote: String?, local: String): Boolean {
+        fun parts(v: String) = v.trim().removePrefix("v").split(".")
+            .mapNotNull { it.toIntOrNull() }
+        val r = parts(remote ?: "")
+        val l = parts(local)
+        if (r.isEmpty()) return false
+        for (i in 0 until maxOf(r.size, l.size)) {
+            val a = r.getOrElse(i) { 0 }
+            val b = l.getOrElse(i) { 0 }
+            if (a != b) return a > b
+        }
+        return false
+    }
+
+    /** 查 GitHub 最新 release；callback 在主執行緒 */
+    fun check(ctx: Context, cb: (String?, String?) -> Unit) {
+        Thread {
+            var tag: String? = null
+            var url: String? = null
+            try {
+                val c = URL("https://api.github.com/repos/$REPO/releases/latest")
+                    .openConnection() as HttpURLConnection
+                c.setRequestProperty("Accept", "application/vnd.github+json")
+                c.setRequestProperty("User-Agent", "abi-app")
+                c.connectTimeout = 15000
+                c.readTimeout = 15000
+                val body = c.inputStream.bufferedReader().readText()
+                c.disconnect()
+                val o = JSONObject(body)
+                tag = o.optString("tag_name")
+                val assets = o.optJSONArray("assets")
+                if (assets != null) {
+                    for (i in 0 until assets.length()) {
+                        val a = assets.getJSONObject(i)
+                        if (a.optString("name").endsWith(".apk")) {
+                            url = a.optString("browser_download_url")
+                            break
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+            }
+            Handler(Looper.getMainLooper()).post { cb(tag, url) }
+        }.start()
+    }
+
+    fun download(ctx: Context, url: String, tag: String): Long? = try {
+        val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val name = "abi-price-" + tag.trim().removePrefix("v") + ".apk"
+        val req = DownloadManager.Request(Uri.parse(url))
+            .setTitle("ABI 價格回報 $tag")
+            .setMimeType(APK_MIME)
+            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
+        dm.enqueue(req)
+    } catch (e: Exception) {
+        null
+    }
+
+    /** 回 true 表示已開啟安裝流程，false 表示需要先允許安裝未知來源 */
+    fun install(ctx: Context, id: Long): Boolean {
+        if (Build.VERSION.SDK_INT >= 26 && !ctx.packageManager.canRequestPackageInstalls()) {
+            try {
+                ctx.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:" + ctx.packageName))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            } catch (_: Exception) {
+            }
+            return false
+        }
+        val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val uri = dm.getUriForDownloadedFile(id) ?: return false
+        val i = Intent(Intent.ACTION_VIEW).setDataAndType(uri, APK_MIME)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        ctx.startActivity(i)
+        return true
+    }
+}
+
 class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var patInput: EditText
+    private lateinit var updateBtn: Button
+    private var newTag: String? = null
+    private var newUrl: String? = null
+    private var pendingDl = -1L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -455,11 +550,61 @@ class MainActivity : Activity() {
                 status.text = "狀態：已停止"
             }
         })
+        updateBtn = Button(this).apply {
+            text = "檢查更新"
+            setOnClickListener { checkUpdate(true) }
+        }
+        ll.addView(updateBtn)
         ll.addView(TextView(this).apply {
             text = "說明：不再定時抓取。Discord 有指令時，bot 會在 repo 寫請求，App 20 秒內看到就抓一次並上傳。"
             textSize = 12f
             setPadding(0, 24, 0, 0)
         })
         setContentView(ll)
+        registerReceiver(dlReceiver, IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
+            if (Build.VERSION.SDK_INT >= 33) Context.RECEIVER_EXPORTED else 0)
+        checkUpdate(false)
+    }
+
+    private val dlReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: Intent?) {
+            if (i?.action != DownloadManager.ACTION_DOWNLOAD_COMPLETE) return
+            val id = i.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+            if (id > 0 && id == pendingDl) {
+                pendingDl = -1L
+                val ok = Updater.install(this@MainActivity, id)
+                status.text = if (ok) "狀態：開始安裝…" else "狀態：請允許安裝未知來源後再按一次更新"
+            }
+        }
+    }
+
+    private fun checkUpdate(manual: Boolean) {
+        val cur = Updater.currentVersion(this)
+        if (manual) status.text = "狀態：檢查更新中…"
+        Updater.check(this) { tag, url ->
+            if (tag == null || url == null) {
+                if (manual) status.text = "狀態：檢查失敗（網路或 API 限制）"
+                return@check
+            }
+            if (Updater.newer(tag, cur)) {
+                newTag = tag
+                newUrl = url
+                updateBtn.text = "下載 $tag"
+                updateBtn.setOnClickListener {
+                    val u = newUrl ?: return@setOnClickListener
+                    pendingDl = Updater.download(this, u, newTag ?: "") ?: -1L
+                    status.text = if (pendingDl > 0) "狀態：下載 $newTag 中…" else "狀態：下載失敗"
+                }
+                status.text = "狀態：有新版本 $tag（目前 v$cur），按下方按鈕下載"
+            } else {
+                updateBtn.text = "檢查更新"
+                if (manual) status.text = "狀態：已是最新版 v$cur"
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        try { unregisterReceiver(dlReceiver) } catch (_: Exception) {}
+        super.onDestroy()
     }
 }
