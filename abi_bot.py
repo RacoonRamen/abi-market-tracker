@@ -112,6 +112,51 @@ def quote_time_for(minors):
     return pt, "GitHub"
 
 
+def role_tag(guild):
+    """回傳設定中的身分組 mention（找不到就回純文字）"""
+    if guild is None or not hasattr(guild, "roles"):
+        return ""
+    cfg = load_json(CFG, {}) or {}
+    want = (cfg.get("mention_role") or "價格終結者").strip()
+    for r in guild.roles:
+        if r.name == want or want in r.name:
+            return f"<@&{r.id}>"
+    return f"@{want}"
+
+
+def new_low_names(snap):
+    """目前低價低於歷史每日最低者（創新低）"""
+    hist = load_json(HISTORY, {}) or {}
+    out = []
+    for it in snap.get("items", []):
+        if str(it.get("minor")) != str(TV_MINOR):
+            continue
+        h = hist.get(str(it.get("id"))) or {}
+        lows = []
+        for row in h.get("day", []):
+            try:
+                lows.append(int(str(row[1]).split("~")[0].replace(",", "").strip()))
+            except Exception:
+                continue
+        try:
+            cur = int(it.get("low") or 0)
+        except Exception:
+            continue
+        if lows and cur and cur < min(lows):
+            out.append((cur / min(lows) - 1, it.get("name", "")))
+    out.sort()
+    return [n for _, n in out]
+
+
+def low_tag(snap, guild):
+    """有創新低時回一段標註文字，否則空字串"""
+    nl = new_low_names(snap)
+    if not nl:
+        return ""
+    tag = role_tag(guild)
+    return "\n🏆 **價格創新低** " + (tag + "　" if tag else "") + "、".join(nl[:3])
+
+
 def quote_source():
     """回 (最新報價時間, 來源字串)"""
     a, b = price_time(), phone_time()
@@ -775,11 +820,11 @@ class AbiBot(commands.Bot):
         chan_id = self.config.get("brief_channel") or self.config.get("alert_channel")
         if not chan_id:
             return
-        txt = daily_brief_text(self.snapshot())
-        if not txt:
-            return
         try:
             chan = self.get_channel(int(chan_id)) or await self.fetch_channel(int(chan_id))
+            txt = daily_brief_text(self.snapshot(), role_tag(getattr(chan, "guild", None)))
+            if not txt:
+                return
             await chan.send(txt)
             save_json(BRIEF_STATE, {"last": key})
         except Exception as e:
@@ -790,7 +835,7 @@ class AbiBot(commands.Bot):
         await self.wait_until_ready()
 
 
-def daily_brief_text(snap):
+def daily_brief_text(snap, role=""):
     """快報內容: 可買 / 接近 / 該等 / 今日變動"""
     tv = [i for i in snap.get("items", [])
           if i["minor"] == TV_MINOR and i.get("buy_price")]
@@ -843,6 +888,10 @@ def daily_brief_text(snap):
             lines.append(f"{arrow} **今日變動最大**：{i['name']} {chg:+.1f}%")
     lines.append("")
     lines.append("-# 補貨價=P25每日最低價 · 深跌價=30天地板×1.03 · `!keys` 看全部")
+    nl = new_low_names(snap)
+    if nl:
+        lines.append("")
+        lines.append("🏆 **價格創新低** " + (role + "　" if role else "") + "、".join(nl[:3]))
     return "\n".join(lines)
 
 
@@ -944,7 +993,7 @@ async def keys_cmd(ctx):
         rows.append([i["name"], fmt(i["low"]), fmt(i["buy_price"]), fmt(i.get("deep_buy", 0)),
                      f"{dist:+.1f}%", SIG_TXT[sig_of(i)]])
     await ctx.send(pick_line(best_pick(pool)) + "\n🔑 **電視台鑰匙補貨推薦**\n```\n"
-                   + table(rows)[:1800] + "\n```\n" + dstamp(snap))
+                   + table(rows)[:1800] + "\n```\n" + dstamp(snap) + low_tag(snap, ctx.guild))
 
 
 @bot.command(name="chart30", brief="30天每日價格區間圖",
@@ -1343,7 +1392,7 @@ async def forecast100_cmd(ctx):
 @bot.command(name="brief", brief="現在該買什麼（快報）",
              description="一句話版決策：現在可買、快到了、最貴別追、今日變動最大。\n自動推播：平日 09:00＋18:00~23:00；週末 12:00~23:00＋00:00~03:00（台北時間）。\n例: !brief")
 async def brief_cmd(ctx):
-    txt = daily_brief_text(bot.snapshot())
+    txt = daily_brief_text(bot.snapshot(), role_tag(ctx.guild))
     await ctx.send(txt or "沒有資料")
 
 
