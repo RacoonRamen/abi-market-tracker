@@ -560,6 +560,48 @@ def _gh_token():
         return None
 
 
+def _git_put(name, text, message):
+    """PAT 沒有寫入權時，改用 deploy key（SSH）push"""
+    if not os.path.exists(os.path.join(HERE, ".git")):
+        return False
+    path = os.path.join(HERE, name)
+
+    def run(*args):
+        return subprocess.run(["git", *args], cwd=HERE, capture_output=True, timeout=120)
+
+    for attempt in range(3):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except Exception as e:
+            print("git put write fail:", e)
+            return False
+        run("add", name)
+        if run("diff", "--cached", "--quiet").returncode == 0:
+            return True
+        c = run("commit", "-q", "-m", message)
+        if c.returncode != 0:
+            print("git put commit fail:", c.stderr.decode("utf-8", "replace")[-200:])
+            return False
+        run("pull", "--rebase", "-q", "-X", "ours", "origin", "main")
+        r = run("push", "-q", "deploy", "HEAD:main")
+        if r.returncode == 0:
+            return True
+        print("git put push fail:", r.stderr.decode("utf-8", "replace")[-200:])
+        run("rebase", "--abort")
+        run("reset", "--hard", "-q", "origin/main")
+    return False
+
+
+def _deploy_key_ok():
+    try:
+        r = subprocess.run(["git", "ls-remote", "--heads", "deploy"], cwd=HERE,
+                           capture_output=True, timeout=20)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 LAST_PUT_ERR = None
 
 
@@ -569,6 +611,10 @@ def _put_repo_file(name, text, message):
     tok = _gh_token()
     if not tok:
         LAST_PUT_ERR = "PAT 未設定"
+        if _git_put(name, text, message):
+            LAST_PUT_ERR = None
+            return True
+        LAST_PUT_ERR = (LAST_PUT_ERR or "") + "；deploy key 也未設定"
         return False
     base = f"https://api.github.com/repos/{GH_REPO}/contents/{name}"
     sha = None
@@ -602,11 +648,19 @@ def _put_repo_file(name, text, message):
         except Exception:
             msg = ""
         LAST_PUT_ERR = f"HTTP {e.code}" + (f"：{msg}" if msg else "")
-        print("put file fail:", LAST_PUT_ERR)
+        print("put file fail:", LAST_PUT_ERR, "-> try deploy key")
+        if _git_put(name, text, message):
+            LAST_PUT_ERR = None
+            return True
+        LAST_PUT_ERR = (LAST_PUT_ERR or "") + "；deploy key 也未設定"
         return False
     except Exception as e:
         LAST_PUT_ERR = f"{type(e).__name__}: {e}"
-        print("put file fail:", LAST_PUT_ERR)
+        print("put file fail:", LAST_PUT_ERR, "-> try deploy key")
+        if _git_put(name, text, message):
+            LAST_PUT_ERR = None
+            return True
+        LAST_PUT_ERR = (LAST_PUT_ERR or "") + "；deploy key 也未設定"
         return False
 
 
@@ -953,6 +1007,7 @@ async def status_cmd(ctx):
         f"🖥 主機：GCP key-slave（bot 常駐）",
         f"📊 報價來源：**{src}**" + (f"，{age} 分鐘前" if age >= 0 else "（無資料）"),
         f"🔑 VM PAT：**{_pat_ok()}**" + (f"（上次寫入失敗：{LAST_PUT_ERR}）" if LAST_PUT_ERR else ""),
+        "🔐 Deploy key：**" + ("OK" if _deploy_key_ok() else "未設定（無法推送）") + "**",
         f"📲 手機請求：`{req.get('id', '-')}`（minor {req.get('minor', '-')}）",
         f"📁 快照：{load_json(SNAPSHOT, {}).get('generated', '-')}",
     ]
