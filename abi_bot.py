@@ -26,6 +26,8 @@ from datetime import datetime, timedelta, timezone
 import discord
 from discord.ext import commands, tasks
 
+from forecast import build_forecast, load_current
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SNAPSHOT = os.path.join(HERE, "snapshot.json")
 HISTORY = os.path.join(HERE, "history.json")
@@ -534,12 +536,76 @@ FRESH_WINDOW = 180  # 秒：資料在這個時間內視為新鮮，直接回覆�
 _fresh_lock = asyncio.Lock()
 
 
+MISC_MINORS = "40801,40802,40803,40804,40805,40806,40807,40808,40809,40810,40812,40813,40814"
+_last_push = 0.0
+
+
+def _rebuild_models():
+    """用最新的 phone_prices.json 重算 snapshot 與 forecast（在 VM 上執行，純 Python）"""
+    py = sys.executable
+    env_note = []
+    try:
+        r1 = subprocess.run(
+            [py, "abi_page.py", "--csv", "prices_all_full.csv", "--hist", "tv_keys.csv",
+             "--history", "history.json", "--json", "snapshot.json",
+             "--phone", "phone_prices.json"],
+            cwd=HERE, capture_output=True, timeout=180)
+        if r1.returncode != 0:
+            env_note.append("abi_page:" + r1.stderr.decode("utf-8", "replace")[-200:])
+        r2 = subprocess.run([py, "forecast.py", "--out", "forecast.json"],
+                            cwd=HERE, capture_output=True, timeout=180)
+        if r2.returncode != 0:
+            env_note.append("forecast:" + r2.stderr.decode("utf-8", "replace")[-200:])
+    except Exception as e:
+        env_note.append(str(e))
+    if env_note:
+        print("rebuild fail:", " | ".join(env_note))
+    return not env_note
+
+
+def _push_data(force=False):
+    """把重算後的資料推回 repo（Pages 會自動更新），有冷卻時間"""
+    global _last_push
+    if not force and time.time() - _last_push < 600:
+        return
+    tok = _gh_token()
+    files = ["snapshot.json", "forecast.json", "dashboard.html", "tv_keys.html", "phone_prices.json"]
+    try:
+        subprocess.run(["git", "-C", HERE, "add"] + files, capture_output=True, timeout=60)
+        if subprocess.run(["git", "-C", HERE, "diff", "--cached", "--quiet"]).returncode == 0:
+            return
+        subprocess.run(["git", "-C", HERE, "-c", "user.name=abi-bot",
+                        "-c", "user.email=abi-bot@users.noreply.github.com",
+                        "commit", "-q", "-m", f"recalc {datetime.now(TAIPEI):%Y-%m-%d %H:%M}"],
+                       capture_output=True, timeout=60)
+        subprocess.run(["git", "-C", HERE, "fetch", "-q", "origin", "main"], capture_output=True, timeout=60)
+        subprocess.run(["git", "-C", HERE, "rebase", "-X", "ours", "origin/main", "-q"],
+                       capture_output=True, timeout=60)
+        url = f"https://x-access-token:{tok}@github.com/{GH_REPO}.git" if tok else "origin"
+        r = subprocess.run(["git", "-C", HERE, "push", "-q", url, "HEAD:main"],
+                           capture_output=True, timeout=90)
+        if r.returncode == 0:
+            _last_push = time.time()
+    except Exception as e:
+        print("push data fail:", e)
+
+
 async def _ensure_fresh(ctx, minor, label, timeout=75):
     """資料新鮮就秒回；否則請手機 App 抓一次並等它上傳。
     回 True = 資料已是最新；False = 沿用上次資料（訊息會說明原因）"""
     def age_now():
+        """依請求的分類判斷新鮮度（phone_prices 內是否已涵蓋這些 minor）"""
         pt, src = quote_source()
-        return ((datetime.now(TAIPEI) - pt).total_seconds() if pt else 1e9), pt, src
+        if not pt:
+            return 1e9, None, src
+        want = [m.strip() for m in str(minor).split(",") if m.strip()] or [TV_MINOR]
+        d = phone_prices() or {}
+        ids = [str(i.get("id")) for i in d.get("items", [])]
+        if src == "手機":
+            covered = any(any(i.startswith(w) for w in want) for i in ids)
+            if not covered:
+                return 1e9, pt, src
+        return (datetime.now(TAIPEI) - pt).total_seconds(), pt, src
 
     age, pt, src = age_now()
     if age <= FRESH_WINDOW:
@@ -560,6 +626,8 @@ async def _ensure_fresh(ctx, minor, label, timeout=75):
             await asyncio.to_thread(_pull)
             age, pt, src = age_now()
             if age <= 60:
+                await asyncio.to_thread(_rebuild_models)
+                await asyncio.to_thread(_push_data)
                 return True
         await ctx.send("⚠ 手機 75 秒內沒有回報（App 是否還在待命？）以下是上次資料")
         return False
@@ -914,6 +982,7 @@ def forecast_png(rows, out_path, title):
 
 async def _top_misc(ctx, rarity, kind, color, n=20):
     """雜物指定稀有度 TopN (rarity=None 全部), 例: !topg 10"""
+    await _ensure_fresh(ctx, MISC_MINORS, "雜物")
     n = max(1, min(n, 25))
     label = f"{kind}色雜物" if kind else "雜物"
     snap = bot.snapshot()
@@ -1058,11 +1127,20 @@ async def kline_cmd(ctx, *, query=""):
         await ctx.send("K 線繪製失敗，請看主機 log")
 
 
-def forecast_rows(fc, band):
-    """band='d1' 用 30 天日線 (明日), band='w1' 用 100 天週線 (下週)"""
-    items = [e for e in fc.get("items", {}).values()
-             if e.get(band) and "鑰匙" in str(e.get("name", ""))]
-    return sorted(items, key=lambda e: e["current"] / max(1, e[band]["center"]))
+def forecast_rows(fc, band, ids=None):
+    """band='d1' 用 30 天日線 (明日), band='w1' 用 100 天週線 (下週)
+    ids: 只保留這些 item id（電視台鑰匙），None = 不篩"""
+    rows = []
+    for iid, e in (fc.get("items", {}) or {}).items():
+        if not e.get(band):
+            continue
+        if ids is not None:
+            if str(iid) not in ids:
+                continue
+        elif "鑰匙" not in str(e.get("name", "")):
+            continue
+        rows.append(e)
+    return sorted(rows, key=lambda e: e["current"] / max(1, e[band]["center"]))
 
 
 def forecast_caption(fc, items, band, period_label):
@@ -1096,8 +1174,42 @@ def forecast_caption(fc, items, band, period_label):
 
 
 async def _send_forecast(ctx, band, period_label, fname):
+    await _ensure_fresh(ctx, TV_MINOR, "電視台鑰匙")
     fc = load_json(os.path.join(HERE, "forecast.json"), {}) or {}
-    items = forecast_rows(fc, band)
+    # 用 history.json + 目前報價即時重算，避免 forecast.json 放久變舊
+    tv_ids = None
+    try:
+        hist = load_json(HISTORY, {}) or {}
+        snap = bot.snapshot()
+        tv_ids = {str(it.get("id")) for it in snap.get("items", [])
+                  if it.get("minor") == TV_MINOR}
+        cur, names = {}, {}
+        for it in snap.get("items", []):
+            iid = str(it.get("id"))
+            names[iid] = it.get("name", "")
+            try:
+                if it.get("low"):
+                    cur[iid] = int(it["low"])
+            except Exception:
+                pass
+        if hist and snap.get("items"):
+            # 鑰匙現價以 phone_prices.json（或較新的 tv_keys.csv）為準
+            try:
+                cur.update(load_current(TV_CSV, PHONE_JSON))
+            except Exception as e:
+                print("forecast current load fail:", e)
+            live = build_forecast(hist, cur, names)
+            # snapshot 缺名稱時，沿用靜態 forecast.json 的
+            for iid, e in live.get("items", {}).items():
+                if str(e.get("name")) == str(iid):
+                    old = (fc.get("items", {}) or {}).get(iid) or {}
+                    if old.get("name"):
+                        e["name"] = old["name"]
+            if live.get("items"):
+                fc = live
+    except Exception as e:
+        print("forecast rebuild fail:", e)
+    items = forecast_rows(fc, band, tv_ids)
     if not items:
         await ctx.send("還沒有預估資料 (forecast.json 缺失或該模型資料不足)"); return
     caption = forecast_caption(fc, items, band, period_label)

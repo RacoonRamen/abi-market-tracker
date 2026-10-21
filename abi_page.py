@@ -782,6 +782,8 @@ def main():
     ap.add_argument("--history", default="history.json",
                     help="abi_history.py output -> 30-day chart & signals")
     ap.add_argument("--open", action="store_true", help="open in browser after build")
+    ap.add_argument("--phone", default="phone_prices.json",
+                    help="手機上傳的即時報價，覆蓋 low/count")
     args = ap.parse_args()
 
     items_idx = json.load(open(args.index, encoding="utf-8"))["items"]
@@ -805,6 +807,26 @@ def main():
                 h["sig"] = "buy" if cur <= m["safe_buy"] else ("sell" if cur >= m["sell_tgt"] else "")
                 h["vs_avg"] = (cur - m["safe_buy"]) / m["safe_buy"] * 100 if m["safe_buy"] else 0
     rows = load_latest_rows(args.csv)
+    # 手機即時報價覆蓋（讓模型用最新價重算）
+    try:
+        if args.phone and os.path.exists(args.phone):
+            ph = json.load(open(args.phone, encoding="utf-8"))
+            pmap = {str(i.get("id")): i for i in ph.get("items", [])}
+            hit = 0
+            for r in rows:
+                p = pmap.get(str(r["item_id"]))
+                if not p:
+                    continue
+                try:
+                    r["lowest_price"] = f'{int(p["low"]):,}'
+                    if p.get("count"):
+                        r["total_count"] = f'{int(p["count"]):,}'
+                    hit += 1
+                except Exception:
+                    pass
+            print(f"phone overlay: {hit} items")
+    except Exception as e:
+        print("phone overlay fail:", e)
     cats_n = defaultdict(int)
     items = []
     tv_unlisted = []

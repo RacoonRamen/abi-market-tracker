@@ -64,8 +64,8 @@ object Scrape {
         return c
     }
 
-    /** 讀 scrape_request.json 的 id；沒有或失敗回 null */
-    fun fetchRequest(ctx: Context): Long? {
+    /** 讀 scrape_request.json，回 (id, minor) */
+    fun fetchRequest(ctx: Context): Pair<Long, String>? {
         val p = pat(ctx)
         if (p.isEmpty()) return null
         val c = api(p, "contents/scrape_request.json").apply {
@@ -74,7 +74,9 @@ object Scrape {
         return try {
             if (c.responseCode == 200) {
                 val t = BufferedReader(InputStreamReader(c.inputStream)).readText()
-                JSONObject(t).optLong("id", 0L).takeIf { it > 0 }
+                val o = JSONObject(t)
+                val id = o.optLong("id", 0L)
+                if (id <= 0) null else id to o.optString("minor", "40505")
             } else null
         } catch (_: Exception) {
             null
@@ -83,9 +85,27 @@ object Scrape {
         }
     }
 
-    /** 背景用 1px WebView 抓價；callback 在主執行緒 */
-    fun run(ctx: Context, reqId: Long, cb: (String) -> Unit) {
+    /** 依序抓多個分類，最後一次上傳 */
+    fun run(ctx: Context, minors: List<String>, reqId: Long, cb: (String) -> Unit) {
         if (!hasOverlay(ctx)) { cb("缺少「顯示在其他應用程式上層」權限"); return }
+        val all = JSONArray()
+        fun step(i: Int) {
+            if (i >= minors.size) {
+                if (all.length() == 0) { cb("沒有解析到任何價格"); return }
+                upload(ctx, all, reqId) { msg -> cb(msg) }
+                return
+            }
+            scrapeOne(ctx, minors[i]) { arr ->
+                if (arr == null) { cb("逾時：${minors[i]} 沒出現價格"); return }
+                for (k in 0 until arr.length()) all.put(arr.getJSONObject(k))
+                step(i + 1)
+            }
+        }
+        step(0)
+    }
+
+    /** 抓單一分類（1px 隱藏 WebView） */
+    private fun scrapeOne(ctx: Context, minor: String, cb: (JSONArray?) -> Unit) {
         val wm = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
         val web = WebView(ctx)
         web.settings.javaScriptEnabled = true
@@ -99,19 +119,19 @@ object Scrape {
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START; alpha = 0.01f }
-        try { wm.addView(web, lp) } catch (e: Exception) { cb("懸浮窗建立失敗: ${e.message}"); return }
+        try { wm.addView(web, lp) } catch (e: Exception) { cb(null); return }
 
         var done = false
         var tries = 0
         val handler = Handler(Looper.getMainLooper())
         lateinit var poll: () -> Unit
 
-        fun finish(msg: String) {
+        fun finish(arr: JSONArray?) {
             if (done) return
             done = true
             handler.removeCallbacksAndMessages(null)
             try { web.destroy(); wm.removeView(web) } catch (_: Exception) {}
-            cb(msg)
+            cb(arr)
         }
 
         web.webViewClient = object : WebViewClient() {
@@ -121,21 +141,20 @@ object Scrape {
         fun startPoll() {
             if (done) return
             tries++
-            if (tries > 60) { finish("逾時：頁面沒出現價格"); return }
+            if (tries > 40) { finish(null); return }
             web.evaluateJavascript(EXTRACT_JS) { raw ->
                 if (done) return@evaluateJavascript
                 val arr = parse(raw)
-                if (arr != null && arr.length() > 0) {
-                    upload(ctx, arr, reqId) { msg -> finish(msg) }
-                } else {
-                    handler.postDelayed({ startPoll() }, 800)
-                }
+                if (arr != null && arr.length() > 0) finish(arr)
+                else handler.postDelayed({ startPoll() }, 800)
             }
         }
 
         poll = { startPoll() }
-        handler.postDelayed({ web.loadUrl(MARKET_URL) }, 300)
-        handler.postDelayed({ if (!done) finish("逾時 90 秒") }, 90_000)
+        handler.postDelayed({
+            web.loadUrl("https://abi-tracker.azurewebsites.net/Market/View?minorId=$minor")
+        }, 250)
+        handler.postDelayed({ if (!done) finish(null) }, 60_000)
     }
 
     private fun parse(raw: String?): JSONArray? {
@@ -236,13 +255,14 @@ class PriceService : Service() {
                 Thread {
                     val req = Scrape.fetchRequest(this@PriceService)
                     val last = getSharedPreferences(PREFS, MODE_PRIVATE).getLong("lastReq", 0L)
-                    if (req != null && req > last) {
+                    if (req != null && req.first > last) {
                         busy = true
+                        val minors = req.second.split(",").map { it.trim() }.filter { it.isNotEmpty() }
                         handler.post {
-                            notify(notif("收到指令，抓取中…"))
-                            Scrape.run(this@PriceService, req) { msg ->
+                            notify(notif("收到指令，抓取 ${minors.size} 個分類…"))
+                            Scrape.run(this@PriceService, minors, req.first) { msg ->
                                 getSharedPreferences(PREFS, MODE_PRIVATE)
-                                    .edit().putLong("lastReq", req).putString("last", msg).apply()
+                                    .edit().putLong("lastReq", req.first).putString("last", msg).apply()
                                 notify(notif("$msg · ${nowText()}"))
                                 busy = false
                             }
@@ -354,7 +374,7 @@ class MainActivity : Activity() {
             text = "立即抓取一次"
             setOnClickListener {
                 status.text = "狀態：抓取中…"
-                Scrape.run(this@MainActivity, 0L) { msg ->
+                Scrape.run(this@MainActivity, listOf("40505"), 0L) { msg ->
                     status.text = "狀態：$msg"
                     prefs.edit().putString("last", msg).apply()
                 }
