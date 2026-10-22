@@ -831,10 +831,11 @@ def _rebuild_models():
 def _push_data(force=False):
     """把重算後的資料推回 repo（Pages 會自動更新），有冷卻時間"""
     global _last_push
-    if not force and time.time() - _last_push < 600:
+    # 每小時最多推一次（降低 GCP 對外流量；Pages 由 Actions 另行重建）
+    if not force and time.time() - _last_push < 3600:
         return
     tok = _gh_token()
-    files = [f for f in ["snapshot.json", "forecast.json", "dashboard.html", "tv_keys.html", "phone_prices.json", "history.json"]
+    files = [f for f in ["snapshot.json", "forecast.json", "tv_keys.html", "phone_prices.json"]
              if os.path.exists(os.path.join(HERE, f))]
     try:
         subprocess.run(["git", "-C", HERE, "add"] + files, capture_output=True, timeout=60)

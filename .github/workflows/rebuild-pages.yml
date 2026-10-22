@@ -1,0 +1,46 @@
+name: rebuild-pages
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rebuild-pages
+  cancel-in-progress: false
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build dashboard from current data
+        run: |
+          python abi_page.py --csv prices_all_full.csv --hist tv_keys.csv \
+            --history history.json --json snapshot.json \
+            --phone phone_prices.json || true
+          ls -l dashboard.html snapshot.json
+
+      - name: Commit dashboard
+        run: |
+          git config user.name "abi-pages"
+          git config user.email "abi-pages@users.noreply.github.com"
+          git add dashboard.html snapshot.json
+          if git diff --cached --quiet; then
+            echo "no change"
+            exit 0
+          fi
+          git commit -q -m "pages: rebuild dashboard $(date -u +%Y-%m-%dT%H:%MZ)"
+          git pull --rebase -q -X ours origin main
+          git push -q origin HEAD:main
