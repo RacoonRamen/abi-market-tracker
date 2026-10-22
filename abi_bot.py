@@ -935,7 +935,7 @@ async def _ensure_fresh(ctx, minor, label, timeout=None, force_old=False, mode="
             if skip_view.skipped:
                 await ctx.send("⏩ 已略過等待，以下使用目前最新快照資料：")
                 return False
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
             if skip_view.skipped:
                 await ctx.send("⏩ 已略過等待，以下使用目前最新快照資料：")
                 return False

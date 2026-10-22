@@ -33,23 +33,24 @@ private const val REPO = "RacoonRamen/abi-market-tracker"
 private const val MARKET_URL = "https://abi-tracker.azurewebsites.net/Market/View?minorId=40505"
 private const val PREFS = "abi"
 private const val CHANNEL = "abi_price"
-private const val APP_VER = "1.6"
+private const val APP_VER = "1.7"
 
 private val EXTRACT_JS = """
 (function(){
   var cards=document.querySelectorAll('#marketItemGrid .market-item-card');
-  var out=[];
+  var out=[], unpriced=0;
   for(var i=0;i<cards.length;i++){
     var c=cards[i], n=c.querySelector('.market-item-name');
     var v=c.querySelector('.market-item-lowest-value');
     var q=c.querySelector('.market-item-count') || c.querySelector('.market-item-total-count') || c.querySelector('.market-item-stock');
     var t=v?v.textContent.trim():'';
+    if(/--/.test(t)){ unpriced++; continue; }
     if(!/\d/.test(t)) continue;
     out.push({id:Number(c.dataset.itemId),
               name:n?(n.getAttribute('title')||n.textContent.trim()):'',
               low:t, count:(q&&q.textContent.trim())?q.textContent.trim():((c.textContent||'').match(/在售\s*([\d,]+)/)||[])[1]||''});
   }
-  return JSON.stringify(out);
+  return JSON.stringify({total:cards.length, filled:out.length, unpriced:unpriced, items:out});
 })()
 """
 
@@ -125,6 +126,9 @@ private val DIALOG_STEP_JS = """
 data class ReqInfo(val id: Long, val minor: String, val mode: String)
 
 object Scrape {
+    @Volatile private var reqEtag: String = ""
+    @Volatile private var cachedReq: ReqInfo? = null
+
     fun hasOverlay(ctx: Context) = Settings.canDrawOverlays(ctx)
 
     private fun pat(ctx: Context) =
@@ -135,28 +139,36 @@ object Scrape {
         c.setRequestProperty("Authorization", "Bearer $pat")
         c.setRequestProperty("Accept", "application/vnd.github+json")
         c.setRequestProperty("User-Agent", "abi-price-app")
-        c.connectTimeout = 15000
-        c.readTimeout = 15000
+        c.connectTimeout = 10000
+        c.readTimeout = 10000
         return c
     }
 
-    /** 讀 scrape_request.json，回 ReqInfo(id, minor, mode) */
+    /** 讀 scrape_request.json，使用 ETag 條件請求（304 不扣 GitHub API 配額，支援 5 秒極速輪詢） */
     fun fetchRequest(ctx: Context): ReqInfo? {
         val p = pat(ctx)
         if (p.isEmpty()) return null
         val c = api(p, "contents/scrape_request.json").apply {
             setRequestProperty("Accept", "application/vnd.github.raw")
+            if (reqEtag.isNotEmpty()) setRequestProperty("If-None-Match", reqEtag)
         }
         return try {
-            if (c.responseCode == 200) {
+            val code = c.responseCode
+            if (code == 304) {
+                cachedReq
+            } else if (code == 200) {
+                val et = c.getHeaderField("ETag")
+                if (!et.isNullOrEmpty()) reqEtag = et
                 val t = BufferedReader(InputStreamReader(c.inputStream)).readText()
                 val o = JSONObject(t)
                 val id = o.optLong("id", 0L)
-                if (id <= 0) null else ReqInfo(
+                val r = if (id <= 0) null else ReqInfo(
                     id,
                     o.optString("minor", "40505"),
                     o.optString("mode", "grid")
                 )
+                cachedReq = r
+                r
             } else null
         } catch (_: Exception) {
             null
@@ -165,27 +177,39 @@ object Scrape {
         }
     }
 
-    /** 依序抓多個分類，最後一次合併上傳（保留未抓分類的舊資料） */
+    /** 多 WebView 併發池（最多 3 個 Worker 平行抓取），最後一次合併上傳 */
     fun run(ctx: Context, minors: List<String>, reqId: Long, mode: String = "grid", cb: (String) -> Unit) {
         if (!hasOverlay(ctx)) { cb("缺少「顯示在其他應用程式上層」權限"); return }
+        if (minors.isEmpty()) { cb("未指定分類"); return }
         val all = JSONArray()
         val histAll = JSONObject()
         val wantHist = (mode == "history")
-        fun step(i: Int) {
-            if (i >= minors.size) {
-                if (all.length() == 0) { cb("沒有解析到任何價格"); return }
-                upload(ctx, all, histAll, reqId, minors, cb)
-                return
+        val lock = Any()
+        var nextIdx = 0
+        val workers = if (wantHist) 1 else minOf(3, minors.size)
+        var activeWorkers = workers
+
+        fun launchWorker() {
+            val m: String
+            synchronized(lock) {
+                if (nextIdx >= minors.size) {
+                    activeWorkers--
+                    if (activeWorkers == 0) {
+                        if (all.length() == 0) cb("沒有解析到任何價格")
+                        else upload(ctx, all, histAll, reqId, minors, cb)
+                    }
+                    return
+                }
+                m = minors[nextIdx++]
             }
-            val m = minors[i]
             scrapeOne(ctx, m, wantHist || m == "40505", wantHist) { arr, hObj ->
-                if (arr == null) {
-                    cb("逾時：$m 沒出現價格")
-                } else {
-                    for (k in 0 until arr.length()) {
-                        val item = arr.getJSONObject(k)
-                        item.put("minor", m)
-                        all.put(item)
+                synchronized(lock) {
+                    if (arr != null) {
+                        for (k in 0 until arr.length()) {
+                            val item = arr.getJSONObject(k)
+                            item.put("minor", m)
+                            all.put(item)
+                        }
                     }
                     if (hObj != null) {
                         val ks = hObj.keys()
@@ -194,14 +218,14 @@ object Scrape {
                             histAll.put(k, hObj.getJSONObject(k))
                         }
                     }
-                    step(i + 1)
                 }
+                launchWorker()
             }
         }
-        step(0)
+        for (w in 0 until workers) launchWorker()
     }
 
-    /** 抓單一分類（1px 隱藏 WebView），可選擇點開 Dialog 取在售數量與 30 天歷史 */
+    /** 抓單一分類（1px 隱藏 WebView，關閉圖片加速渲染，filled==total 0延遲收工） */
     private fun scrapeOne(
         ctx: Context,
         minor: String,
@@ -213,6 +237,8 @@ object Scrape {
         val web = WebView(ctx)
         web.settings.javaScriptEnabled = true
         web.settings.domStorageEnabled = true
+        web.settings.blockNetworkImage = true
+        web.settings.loadsImagesAutomatically = false
         web.settings.userAgentString =
             "Mozilla/5.0 (Linux; Android 14; Pixel) AppleWebKit/537.36 (KHTML, like Gecko) " +
             "Chrome/124.0.0.0 Mobile Safari/537.36"
@@ -292,7 +318,7 @@ object Scrape {
                 val o = try { if (s != null) JSONObject(s) else null } catch (_: Exception) { null }
                 val st = o?.optString("st") ?: "skip"
                 if (st == "wait") {
-                    handler.postDelayed({ expandDetails(ids, idx) }, 450)
+                    handler.postDelayed({ expandDetails(ids, idx) }, 280)
                 } else {
                     if (st == "done" && o != null) {
                         val cnt = o.optString("count", "")
@@ -307,7 +333,7 @@ object Scrape {
                             })
                         }
                     }
-                    handler.postDelayed({ expandDetails(ids, idx + 1) }, 250)
+                    handler.postDelayed({ expandDetails(ids, idx + 1) }, 150)
                 }
             }
         }
@@ -326,36 +352,44 @@ object Scrape {
         fun startPoll() {
             if (done) return
             tries++
-            if (tries > 45) {
+            if (tries > 65) {
                 if (merged.length() > 0) onGridStable() else finish(null)
                 return
             }
             web.evaluateJavascript(EXTRACT_JS) { raw ->
                 if (done) return@evaluateJavascript
-                val arr = parse(raw)
-                if (arr != null) mergeInto(arr)
+                val stateObj = parseState(raw)
+                val arr = stateObj?.optJSONArray("items")
+                val total = stateObj?.optInt("total", 0) ?: 0
+                val filled = stateObj?.optInt("filled", 0) ?: 0
+                val unpriced = stateObj?.optInt("unpriced", 0) ?: 0
+                if (arr != null && arr.length() > 0) mergeInto(arr)
+                // 快速判定：若所有卡片皆已填入價格（或標示 -- 無掛賣），直接收工不必多等
+                if (total > 0 && filled > 0 && (filled + unpriced) >= total) {
+                    onGridStable()
+                    return@evaluateJavascript
+                }
                 val sig = signature()
                 if (merged.length() > 0 && sig == prevSig) stable++ else stable = 0
                 prevSig = sig
                 if (merged.length() > 0 && stable >= 2) onGridStable()
-                else handler.postDelayed({ startPoll() }, 900)
+                else handler.postDelayed({ startPoll() }, 350)
             }
         }
 
         poll = { startPoll() }
         handler.postDelayed({
             web.loadUrl("https://abi-tracker.azurewebsites.net/Market/View?minorId=$minor")
-        }, 250)
-        val maxWait = if (wantHist) 180_000L else 65_000L
+        }, 100)
+        val maxWait = if (wantHist) 180_000L else 45_000L
         handler.postDelayed({ if (!done) finish(if (merged.length() > 0) mergedArray() else null) }, maxWait)
     }
 
-    private fun parse(raw: String?): JSONArray? {
+    private fun parseState(raw: String?): JSONObject? {
         if (raw == null || raw == "null") return null
         return try {
             val s = JSONTokener(raw).nextValue() as? String ?: return null
-            val a = JSONArray(s)
-            if (a.length() == 0) null else a
+            JSONObject(s)
         } catch (e: Exception) { null }
     }
 
@@ -543,7 +577,7 @@ class PriceService : Service() {
                         busy = true
                         val minors = req.minor.split(",").map { it.trim() }.filter { it.isNotEmpty() }
                         handler.post {
-                            notify(notif("收到指令 #${req.id}，抓取 ${minors.size} 個分類 (${req.mode})…"))
+                            notify(notif("收到指令 #${req.id}，併發抓取 ${minors.size} 個分類 (${req.mode})…"))
                             Scrape.run(this@PriceService, minors, req.id, req.mode) { msg ->
                                 getSharedPreferences(PREFS, MODE_PRIVATE)
                                     .edit().putLong("lastReq", req.id).putString("last", msg).apply()
@@ -554,7 +588,7 @@ class PriceService : Service() {
                     }
                 }.start()
             }
-            handler.postDelayed(this, 20_000)
+            handler.postDelayed(this, 6_000)
         }
     }
 
@@ -735,7 +769,7 @@ class MainActivity : Activity() {
             } catch (e: Exception) {
                 "?"
             }
-            text = "版本 v$v　·　多分類抓取"
+            text = "版本 v$v　·　3路併發極速抓取"
             textSize = 12f
             setTextColor(0xFF666666.toInt())
             setPadding(0, 4, 0, 8)
@@ -784,7 +818,7 @@ class MainActivity : Activity() {
                     requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
                 }
                 startForegroundService(Intent(this@MainActivity, PriceService::class.java))
-                status.text = "狀態：已啟動，等待 Discord 指令（每 20 秒檢查）"
+                status.text = "狀態：已啟動，等待 Discord 指令（每 6 秒極速檢查）"
             }
         })
         ll.addView(Button(this).apply {
@@ -800,7 +834,7 @@ class MainActivity : Activity() {
         }
         ll.addView(updateBtn)
         ll.addView(TextView(this).apply {
-            text = "說明：不再定時抓取。Discord 有指令時，bot 會在 repo 寫請求，App 20 秒內看到就抓一次並上傳。"
+            text = "說明：Discord 有指令時，App 6 秒內透過 ETag 發現請求，以 3 路併發隱藏 WebView 抓取並合併上傳。"
             textSize = 12f
             setPadding(0, 24, 0, 0)
         })
