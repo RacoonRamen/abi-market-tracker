@@ -613,14 +613,21 @@ def _gh_token():
         return None
 
 
+def _ssh_env():
+    env = os.environ.copy()
+    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+    return env
+
+
 def _git_put(name, text, message):
     """PAT 沒有寫入權時，改用 deploy key（SSH）push"""
     if not os.path.exists(os.path.join(HERE, ".git")):
         return False
     path = os.path.join(HERE, name)
+    env = _ssh_env()
 
     def run(*args):
-        return subprocess.run(["git", *args], cwd=HERE, capture_output=True, timeout=120)
+        return subprocess.run(["git", *args], cwd=HERE, env=env, capture_output=True, timeout=120)
 
     for attempt in range(3):
         try:
@@ -632,7 +639,8 @@ def _git_put(name, text, message):
         run("add", name)
         if run("diff", "--cached", "--quiet").returncode == 0:
             return True
-        c = run("commit", "-q", "-m", message)
+        c = run("-c", "user.name=abi-bot", "-c", "user.email=abi-bot@users.noreply.github.com",
+                "commit", "-q", "-m", message)
         if c.returncode != 0:
             print("git put commit fail:", c.stderr.decode("utf-8", "replace")[-200:])
             return False
@@ -649,7 +657,7 @@ def _git_put(name, text, message):
 def _deploy_key_ok():
     try:
         r = subprocess.run(["git", "ls-remote", "--heads", "deploy"], cwd=HERE,
-                           capture_output=True, timeout=20)
+                           env=_ssh_env(), capture_output=True, timeout=20)
         return r.returncode == 0
     except Exception:
         return False
@@ -659,15 +667,14 @@ LAST_PUT_ERR = None
 
 
 def _put_repo_file(name, text, message):
-    """用 PAT 寫檔到 repo（需要 Contents: Read and write）；回 True/False"""
+    """優先用 deploy key（SSH，無到期日且權限穩定）寫檔；失敗時退回嘗試 PAT"""
     global LAST_PUT_ERR
+    if _deploy_key_ok() and _git_put(name, text, message):
+        LAST_PUT_ERR = None
+        return True
     tok = _gh_token()
     if not tok:
-        LAST_PUT_ERR = "PAT 未設定"
-        if _git_put(name, text, message):
-            LAST_PUT_ERR = None
-            return True
-        LAST_PUT_ERR = (LAST_PUT_ERR or "") + "；deploy key 也未設定"
+        LAST_PUT_ERR = "PAT 未設定；deploy key push 也失敗"
         return False
     base = f"https://api.github.com/repos/{GH_REPO}/contents/{name}"
     sha = None
