@@ -809,10 +809,15 @@ def main():
     rows = load_latest_rows(args.csv)
     # 手機即時報價覆蓋（讓模型用最新價重算）
     phone_data = None
+    pmap = {}
+    phone_top_ts = ""
+    phone_cat_ts = {}
     try:
         if args.phone and os.path.exists(args.phone):
             ph = json.load(open(args.phone, encoding="utf-8"))
             phone_data = ph
+            phone_top_ts = (ph.get("fetched_at") or "").strip()
+            phone_cat_ts = ph.get("category_ts") or {}
             pmap = {str(i.get("id")): i for i in ph.get("items", [])}
             hit = 0
             for r in rows:
@@ -820,10 +825,14 @@ def main():
                 if not p:
                     continue
                 try:
-                    r["lowest_price"] = f'{int(p["low"]):,}'
-                    if p.get("count"):
-                        r["total_count"] = f'{int(p["count"]):,}'
-                    hit += 1
+                    if int(p.get("low") or 0) > 0:
+                        r["lowest_price"] = f'{int(p["low"]):,}'
+                        pts = (p.get("ts") or phone_cat_ts.get(str(r.get("minor"))) or phone_top_ts).strip()
+                        if pts and pts > (r.get("fetched_at_utc") or ""):
+                            r["fetched_at_utc"] = pts
+                        if p.get("count") and int(p.get("count") or 0) > 0:
+                            r["total_count"] = f'{int(p["count"]):,}'
+                        hit += 1
                 except Exception:
                     pass
             print(f"phone overlay: {hit} items")
@@ -843,8 +852,12 @@ def main():
         count_raw = (r.get("total_count") or "").replace(",", "")
         h = hist.get(r["item_id"], {})
         sh = site_hist.get(r["item_id"], {})
-        if h.get("hist"):
-            low = h["hist"][-1]  # 追蹤 CSV 較新時以最新追蹤價為準
+        row_ts = (r.get("fetched_at_utc") or "").strip()
+        if h.get("hist") and h.get("pts"):
+            hist_ts = (h["pts"][-1][0] or "").strip()
+            # 只有當追蹤 CSV (tv_keys.csv) 比手機/目前 row 還新時，才用 hist[-1] 覆蓋
+            if not row_ts or hist_ts > row_ts:
+                low = h["hist"][-1]
         count = int(count_raw) if count_raw.isdigit() else 0
         # 日成交量/成交額 (有 recent 成交資料時)
         vol_day = turnover = 0
@@ -856,6 +869,16 @@ def main():
             vol_day = sum(p[2] for p in rec) / span
             turnover = vol_day * sum(p[1] for p in rec) / len(rec)
         m = models.get(r["item_id"], {})
+        # 用最終的 low 重新計算買賣訊號與均價偏離，避免沿用舊 tv_keys.csv 的訊號
+        sig = h.get("sig", "")
+        vs_avg = h.get("vs_avg", 0)
+        if m.get("safe_buy"):
+            sig = "buy" if low <= m["safe_buy"] else ("sell" if low >= m.get("sell_tgt", float("inf")) else "")
+            vs_avg = (low - m["safe_buy"]) / m["safe_buy"] * 100
+        elif h.get("avg"):
+            ratio = low / h["avg"]
+            sig = "buy" if ratio <= 0.80 else ("sell" if ratio >= 1.20 else "")
+            vs_avg = (low - h["avg"]) / h["avg"] * 100
         # ===== 賣出推薦模型 =====
         net0 = low * (1 - FEE)
         stock_days = 0
@@ -871,10 +894,11 @@ def main():
             "id": r["item_id"], "name": names_zh.get(r["item_id"], r["name"]),
             "name_en": r["name"], "minor": r["minor"], "cat": r["category"],
             "major": MINOR_TO_MAJOR.get(r["minor"], "?"),
-            "low": low, "contact": float(meta.get("contactPrice") or 0),
+            "low": int(low) if low == int(low) else low,
+            "contact": float(meta.get("contactPrice") or 0),
             "ref": float(meta.get("referencePrice") or 0),
             "count": count,
-            "sig": h.get("sig", ""), "vs_avg": round(h.get("vs_avg", 0), 1),
+            "sig": sig, "vs_avg": round(vs_avg, 1),
             "hmin": h.get("min", 0), "hmax": h.get("max", 0), "hn": h.get("n", 0),
             "havg": h.get("avg", 0), "pts": h.get("pts", []),
             "buy_price": int(m["safe_buy"]) if m.get("safe_buy") else 0,
@@ -886,6 +910,7 @@ def main():
             "stock_days": round(stock_days, 2), "pos_pct": round(pos_pct, 0),
             "ref_ratio": round(ref_ratio, 2), "score": int(score),
             "day30": sh.get("day30", []), "recent": sh.get("recent", []),
+            "ts": row_ts,
         })
         cats_n[(r["minor"], r["category"])] += 1
 

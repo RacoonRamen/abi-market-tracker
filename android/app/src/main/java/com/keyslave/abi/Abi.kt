@@ -33,6 +33,7 @@ private const val REPO = "RacoonRamen/abi-market-tracker"
 private const val MARKET_URL = "https://abi-tracker.azurewebsites.net/Market/View?minorId=40505"
 private const val PREFS = "abi"
 private const val CHANNEL = "abi_price"
+private const val APP_VER = "1.6"
 
 private val EXTRACT_JS = """
 (function(){
@@ -52,6 +53,77 @@ private val EXTRACT_JS = """
 })()
 """
 
+private val DIALOG_STEP_JS = """
+(function(itemId, wantHist){
+  if(!window._abiDlg || window._abiDlg.id !== itemId){
+    var btn=document.querySelector('.market-item-card[data-item-id="'+itemId+'"] .market-details-button');
+    if(!btn) return JSON.stringify({st:'skip'});
+    window._abiDlg={id:itemId, phase:0, t0:Date.now(), rec:[], day:[], week:[], count:''};
+    btn.click();
+    return JSON.stringify({st:'wait'});
+  }
+  var s=window._abiDlg;
+  if(Date.now()-s.t0>18000){
+    try{document.querySelector('#marketItemClose').click();}catch(e){}
+    window._abiDlg=null;
+    return JSON.stringify({st:'timeout'});
+  }
+  var dlg=document.querySelector('#marketItemDialog');
+  var bars=dlg?dlg.querySelector('.market-item-price-bars'):null;
+  if(!bars) return JSON.stringify({st:'wait'});
+  var cntEl=dlg.querySelector('.market-item-count');
+  if(cntEl) s.count=cntEl.textContent.trim();
+  if(!wantHist){
+    try{document.querySelector('#marketItemClose').click();}catch(e){}
+    window._abiDlg=null;
+    return JSON.stringify({st:'done', count:s.count});
+  }
+  var det=dlg.querySelector('details.market-item-history');
+  function rows(){
+    if(!det) return [];
+    var trs=det.querySelectorAll('tbody tr'), r=[];
+    for(var i=0;i<trs.length;i++){
+      var tds=trs[i].children, row=[];
+      for(var j=0;j<tds.length;j++) row.push(tds[j].textContent.trim());
+      if(row.length>=3 && /\d/.test(row[0])) r.push(row);
+    }
+    return r;
+  }
+  if(s.phase===0){
+    if(det) det.open=true;
+    s.phase=1; s.t1=Date.now();
+    return JSON.stringify({st:'wait'});
+  }
+  if(s.phase===1){
+    if(Date.now()-s.t1<2200) return JSON.stringify({st:'wait'});
+    s.rec=rows();
+    var db=dlg.querySelector('.market-history-range-btn[data-range="day"]');
+    if(db) db.click();
+    s.phase=2; s.t1=Date.now();
+    return JSON.stringify({st:'wait'});
+  }
+  if(s.phase===2){
+    if(Date.now()-s.t1<2200) return JSON.stringify({st:'wait'});
+    s.day=rows();
+    var wb=dlg.querySelector('.market-history-range-btn[data-range="week"]');
+    if(wb) wb.click();
+    s.phase=3; s.t1=Date.now();
+    return JSON.stringify({st:'wait'});
+  }
+  if(s.phase===3){
+    if(Date.now()-s.t1<2000) return JSON.stringify({st:'wait'});
+    s.week=rows();
+    try{document.querySelector('#marketItemClose').click();}catch(e){}
+    var res={st:'done', count:s.count, recent:s.rec, day:s.day, week:s.week};
+    window._abiDlg=null;
+    return JSON.stringify(res);
+  }
+  return JSON.stringify({st:'wait'});
+})
+"""
+
+data class ReqInfo(val id: Long, val minor: String, val mode: String)
+
 object Scrape {
     fun hasOverlay(ctx: Context) = Settings.canDrawOverlays(ctx)
 
@@ -68,8 +140,8 @@ object Scrape {
         return c
     }
 
-    /** 讀 scrape_request.json，回 (id, minor) */
-    fun fetchRequest(ctx: Context): Pair<Long, String>? {
+    /** 讀 scrape_request.json，回 ReqInfo(id, minor, mode) */
+    fun fetchRequest(ctx: Context): ReqInfo? {
         val p = pat(ctx)
         if (p.isEmpty()) return null
         val c = api(p, "contents/scrape_request.json").apply {
@@ -80,7 +152,11 @@ object Scrape {
                 val t = BufferedReader(InputStreamReader(c.inputStream)).readText()
                 val o = JSONObject(t)
                 val id = o.optLong("id", 0L)
-                if (id <= 0) null else id to o.optString("minor", "40505")
+                if (id <= 0) null else ReqInfo(
+                    id,
+                    o.optString("minor", "40505"),
+                    o.optString("mode", "grid")
+                )
             } else null
         } catch (_: Exception) {
             null
@@ -89,21 +165,35 @@ object Scrape {
         }
     }
 
-    /** 依序抓多個分類，最後一次上傳 */
-    fun run(ctx: Context, minors: List<String>, reqId: Long, cb: (String) -> Unit) {
+    /** 依序抓多個分類，最後一次合併上傳（保留未抓分類的舊資料） */
+    fun run(ctx: Context, minors: List<String>, reqId: Long, mode: String = "grid", cb: (String) -> Unit) {
         if (!hasOverlay(ctx)) { cb("缺少「顯示在其他應用程式上層」權限"); return }
         val all = JSONArray()
+        val histAll = JSONObject()
+        val wantHist = (mode == "history")
         fun step(i: Int) {
             if (i >= minors.size) {
                 if (all.length() == 0) { cb("沒有解析到任何價格"); return }
-                upload(ctx, all, reqId, minors.joinToString(",")) { msg -> cb(msg) }
+                upload(ctx, all, histAll, reqId, minors, cb)
                 return
             }
-            scrapeOne(ctx, minors[i]) { arr ->
+            val m = minors[i]
+            scrapeOne(ctx, m, wantHist || m == "40505", wantHist) { arr, hObj ->
                 if (arr == null) {
-                    cb("逾時：${minors[i]} 沒出現價格")
+                    cb("逾時：$m 沒出現價格")
                 } else {
-                    for (k in 0 until arr.length()) all.put(arr.getJSONObject(k))
+                    for (k in 0 until arr.length()) {
+                        val item = arr.getJSONObject(k)
+                        item.put("minor", m)
+                        all.put(item)
+                    }
+                    if (hObj != null) {
+                        val ks = hObj.keys()
+                        while (ks.hasNext()) {
+                            val k = ks.next()
+                            histAll.put(k, hObj.getJSONObject(k))
+                        }
+                    }
                     step(i + 1)
                 }
             }
@@ -111,8 +201,14 @@ object Scrape {
         step(0)
     }
 
-    /** 抓單一分類（1px 隱藏 WebView） */
-    private fun scrapeOne(ctx: Context, minor: String, cb: (JSONArray?) -> Unit) {
+    /** 抓單一分類（1px 隱藏 WebView），可選擇點開 Dialog 取在售數量與 30 天歷史 */
+    private fun scrapeOne(
+        ctx: Context,
+        minor: String,
+        wantCount: Boolean,
+        wantHist: Boolean,
+        cb: (JSONArray?, JSONObject?) -> Unit
+    ) {
         val wm = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
         val web = WebView(ctx)
         web.settings.javaScriptEnabled = true
@@ -126,28 +222,36 @@ object Scrape {
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START; alpha = 0.01f }
-        try { wm.addView(web, lp) } catch (e: Exception) { cb(null); return }
+        try { wm.addView(web, lp) } catch (e: Exception) { cb(null, null); return }
 
         var done = false
         var tries = 0
         val handler = Handler(Looper.getMainLooper())
         lateinit var poll: () -> Unit
 
+        val merged = JSONObject()
+        val histMap = JSONObject()
+        var prevSig = ""
+        var stable = 0
+
+        fun mergedArray(): JSONArray {
+            val out = JSONArray()
+            val keys = merged.keys()
+            while (keys.hasNext()) out.put(merged.getJSONObject(keys.next()))
+            return out
+        }
+
         fun finish(arr: JSONArray?) {
             if (done) return
             done = true
             handler.removeCallbacksAndMessages(null)
             try { web.destroy(); wm.removeView(web) } catch (_: Exception) {}
-            cb(arr)
+            cb(arr, if (histMap.length() > 0) histMap else null)
         }
 
         web.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) { poll() }
         }
-
-        val merged = JSONObject()
-        var prevSig = ""
-        var stable = 0
 
         fun mergeInto(arr: JSONArray) {
             for (k in 0 until arr.length()) {
@@ -162,13 +266,6 @@ object Scrape {
             }
         }
 
-        fun mergedArray(): JSONArray {
-            val out = JSONArray()
-            val keys = merged.keys()
-            while (keys.hasNext()) out.put(merged.getJSONObject(keys.next()))
-            return out
-        }
-
         fun signature(): String {
             val ids = ArrayList<String>()
             val keys = merged.keys()
@@ -181,11 +278,56 @@ object Scrape {
             return sb.toString()
         }
 
+        fun expandDetails(ids: List<String>, idx: Int) {
+            if (done) return
+            if (idx >= ids.size) {
+                finish(mergedArray())
+                return
+            }
+            val iid = ids[idx]
+            val js = "$DIALOG_STEP_JS($iid, ${if (wantHist) "true" else "false"})"
+            web.evaluateJavascript(js) { raw ->
+                if (done) return@evaluateJavascript
+                val s = try { JSONTokener(raw ?: "").nextValue() as? String } catch (_: Exception) { null }
+                val o = try { if (s != null) JSONObject(s) else null } catch (_: Exception) { null }
+                val st = o?.optString("st") ?: "skip"
+                if (st == "wait") {
+                    handler.postDelayed({ expandDetails(ids, idx) }, 450)
+                } else {
+                    if (st == "done" && o != null) {
+                        val cnt = o.optString("count", "")
+                        if (cnt.isNotEmpty() && merged.has(iid)) {
+                            merged.getJSONObject(iid).put("count", cnt)
+                        }
+                        if (wantHist) {
+                            histMap.put(iid, JSONObject().apply {
+                                put("recent", o.optJSONArray("recent") ?: JSONArray())
+                                put("day", o.optJSONArray("day") ?: JSONArray())
+                                put("week", o.optJSONArray("week") ?: JSONArray())
+                            })
+                        }
+                    }
+                    handler.postDelayed({ expandDetails(ids, idx + 1) }, 250)
+                }
+            }
+        }
+
+        fun onGridStable() {
+            if (!wantCount && !wantHist) {
+                finish(mergedArray())
+                return
+            }
+            val ids = ArrayList<String>()
+            val ks = merged.keys()
+            while (ks.hasNext()) ids.add(ks.next())
+            expandDetails(ids, 0)
+        }
+
         fun startPoll() {
             if (done) return
             tries++
             if (tries > 45) {
-                finish(if (merged.length() > 0) mergedArray() else null)
+                if (merged.length() > 0) onGridStable() else finish(null)
                 return
             }
             web.evaluateJavascript(EXTRACT_JS) { raw ->
@@ -195,7 +337,7 @@ object Scrape {
                 val sig = signature()
                 if (merged.length() > 0 && sig == prevSig) stable++ else stable = 0
                 prevSig = sig
-                if (merged.length() > 0 && stable >= 2) finish(mergedArray())
+                if (merged.length() > 0 && stable >= 2) onGridStable()
                 else handler.postDelayed({ startPoll() }, 900)
             }
         }
@@ -204,7 +346,8 @@ object Scrape {
         handler.postDelayed({
             web.loadUrl("https://abi-tracker.azurewebsites.net/Market/View?minorId=$minor")
         }, 250)
-        handler.postDelayed({ if (!done) finish(null) }, 60_000)
+        val maxWait = if (wantHist) 180_000L else 65_000L
+        handler.postDelayed({ if (!done) finish(if (merged.length() > 0) mergedArray() else null) }, maxWait)
     }
 
     private fun parse(raw: String?): JSONArray? {
@@ -219,36 +362,103 @@ object Scrape {
     private fun digits(s: String?): Long =
         (s ?: "").filter { it.isDigit() }.toLongOrNull() ?: 0L
 
-    private fun upload(ctx: Context, arr: JSONArray, reqId: Long, minorLabel: String, cb: (String) -> Unit) {
+    private fun upload(
+        ctx: Context,
+        arr: JSONArray,
+        histAll: JSONObject,
+        reqId: Long,
+        minors: List<String>,
+        cb: (String) -> Unit
+    ) {
         val p = pat(ctx)
         if (p.isEmpty()) { cb("缺少 GitHub PAT"); return }
 
         Thread {
-            val items = JSONArray()
+            val ts = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+                .apply { timeZone = TimeZone.getTimeZone("UTC") }.format(Date())
+
+            val newItemsById = LinkedHashMap<String, JSONObject>()
             for (k in 0 until arr.length()) {
                 val o = arr.getJSONObject(k)
                 val low = digits(o.optString("low"))
                 if (low <= 0) continue
-                items.put(JSONObject().apply {
+                val idStr = o.optLong("id").toString()
+                val m = o.optString("minor", "")
+                newItemsById[idStr] = JSONObject().apply {
                     put("id", o.optLong("id"))
+                    if (m.isNotEmpty()) put("minor", m)
                     put("name", o.optString("name"))
                     put("low", low)
                     put("count", digits(o.optString("count")))
-                })
+                    put("ts", ts)
+                }
             }
-            if (items.length() == 0) { cb("沒有解析到任何價格"); return@Thread }
+            if (newItemsById.isEmpty()) {
+                Handler(Looper.getMainLooper()).post { cb("沒有解析到任何價格") }
+                return@Thread
+            }
 
-            val ts = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
-                .apply { timeZone = TimeZone.getTimeZone("UTC") }.format(Date())
-            val payload = JSONObject().apply {
-                put("fetched_at", ts)
-                put("minor", minorLabel)
-                put("source", "android-app")
-                put("req", reqId)
-                put("items", items)
-            }
             val msg = try {
-                putFile(p, "phone_prices.json", payload.toString(1), "phone prices $ts (req $reqId)")
+                // 先讀取現有 phone_prices.json，合併保留未抓分類的資料（防止抓鑰匙時洗掉雜物）
+                val (oldSha, oldJson) = getFileWithContent(p, "phone_prices.json")
+                val catTs = JSONObject()
+                val oldCatTs = oldJson?.optJSONObject("category_ts")
+                if (oldCatTs != null) {
+                    val ks = oldCatTs.keys()
+                    while (ks.hasNext()) {
+                        val k = ks.next()
+                        catTs.put(k, oldCatTs.optString(k))
+                    }
+                }
+                for (m in minors) catTs.put(m, ts)
+
+                val mergedMap = LinkedHashMap<String, JSONObject>()
+                val prevCountMap = HashMap<String, Long>()
+                val scrapedSet = minors.toSet()
+                val oldItems = oldJson?.optJSONArray("items")
+                if (oldItems != null) {
+                    for (i in 0 until oldItems.length()) {
+                        val it = oldItems.optJSONObject(i) ?: continue
+                        val idStr = it.optLong("id").toString()
+                        val oldCnt = it.optLong("count", 0L)
+                        if (oldCnt > 0L) prevCountMap[idStr] = oldCnt
+                        val im = it.optString("minor", "")
+                        // 只保留「非本次重抓分類」的既有商品，或被本次新資料覆蓋
+                        if (im.isEmpty() || im !in scrapedSet) {
+                            mergedMap[idStr] = it
+                        }
+                    }
+                }
+                for ((idStr, obj) in newItemsById) {
+                    val prevCnt = prevCountMap[idStr] ?: 0L
+                    if (obj.optLong("count", 0L) <= 0L && prevCnt > 0L) {
+                        obj.put("count", prevCnt)
+                    }
+                    mergedMap[idStr] = obj
+                }
+
+                val finalItems = JSONArray()
+                for (obj in mergedMap.values) finalItems.put(obj)
+
+                val payload = JSONObject().apply {
+                    put("fetched_at", ts)
+                    put("app_version", APP_VER)
+                    put("minor", minors.joinToString(","))
+                    put("source", "android-app")
+                    put("req", reqId)
+                    put("category_ts", catTs)
+                    put("items", finalItems)
+                }
+                val r1 = putFile(p, "phone_prices.json", payload.toString(1), "phone prices $ts (req $reqId)", oldSha)
+                if (histAll.length() > 0) {
+                    val hPayload = JSONObject().apply {
+                        put("fetched_at", ts)
+                        put("req", reqId)
+                        put("items", histAll)
+                    }
+                    putFile(p, "phone_history.json", hPayload.toString(1), "phone history $ts (req $reqId)", null)
+                }
+                r1
             } catch (e: Exception) {
                 "上傳失敗: ${e.message}"
             }
@@ -256,14 +466,38 @@ object Scrape {
         }.start()
     }
 
-    private fun putFile(pat: String, name: String, content: String, message: String): String {
+    private fun getFileWithContent(pat: String, name: String): Pair<String?, JSONObject?> {
         var sha: String? = null
+        var json: JSONObject? = null
         val g = api(pat, "contents/$name")
-        if (g.responseCode == 200) {
-            val body = BufferedReader(InputStreamReader(g.inputStream)).readText()
-            sha = JSONObject(body).optString("sha").ifEmpty { null }
+        try {
+            if (g.responseCode == 200) {
+                val body = BufferedReader(InputStreamReader(g.inputStream)).readText()
+                val meta = JSONObject(body)
+                sha = meta.optString("sha").ifEmpty { null }
+                val b64 = meta.optString("content", "").replace("\n", "").replace("\r", "")
+                if (b64.isNotEmpty()) {
+                    val raw = String(android.util.Base64.decode(b64, android.util.Base64.DEFAULT))
+                    json = JSONObject(raw)
+                }
+            }
+        } catch (_: Exception) {
+        } finally {
+            g.disconnect()
         }
-        g.disconnect()
+        return sha to json
+    }
+
+    private fun putFile(pat: String, name: String, content: String, message: String, knownSha: String? = null): String {
+        var sha: String? = knownSha
+        if (sha == null) {
+            val g = api(pat, "contents/$name")
+            if (g.responseCode == 200) {
+                val body = BufferedReader(InputStreamReader(g.inputStream)).readText()
+                sha = JSONObject(body).optString("sha").ifEmpty { null }
+            }
+            g.disconnect()
+        }
 
         val body = JSONObject().apply {
             put("message", message)
@@ -305,14 +539,14 @@ class PriceService : Service() {
                 Thread {
                     val req = Scrape.fetchRequest(this@PriceService)
                     val last = getSharedPreferences(PREFS, MODE_PRIVATE).getLong("lastReq", 0L)
-                    if (req != null && req.first > last) {
+                    if (req != null && req.id > last) {
                         busy = true
-                        val minors = req.second.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                        val minors = req.minor.split(",").map { it.trim() }.filter { it.isNotEmpty() }
                         handler.post {
-                            notify(notif("收到指令，抓取 ${minors.size} 個分類…"))
-                            Scrape.run(this@PriceService, minors, req.first) { msg ->
+                            notify(notif("收到指令 #${req.id}，抓取 ${minors.size} 個分類 (${req.mode})…"))
+                            Scrape.run(this@PriceService, minors, req.id, req.mode) { msg ->
                                 getSharedPreferences(PREFS, MODE_PRIVATE)
-                                    .edit().putLong("lastReq", req.first).putString("last", msg).apply()
+                                    .edit().putLong("lastReq", req.id).putString("last", msg).apply()
                                 notify(notif("$msg · ${nowText()}"))
                                 busy = false
                             }
@@ -524,10 +758,20 @@ class MainActivity : Activity() {
             }
         })
         ll.addView(Button(this).apply {
-            text = "立即抓取一次"
+            text = "立即抓取一次（鑰匙＋在售量）"
             setOnClickListener {
                 status.text = "狀態：抓取中…"
-                Scrape.run(this@MainActivity, listOf("40505"), 0L) { msg ->
+                Scrape.run(this@MainActivity, listOf("40505"), 0L, "grid") { msg ->
+                    status.text = "狀態：$msg"
+                    prefs.edit().putString("last", msg).apply()
+                }
+            }
+        })
+        ll.addView(Button(this).apply {
+            text = "更新鑰匙 30 天歷史"
+            setOnClickListener {
+                status.text = "狀態：展開詳情抓取 30 天歷史中（約 1~2 分鐘）…"
+                Scrape.run(this@MainActivity, listOf("40505"), 0L, "history") { msg ->
                     status.text = "狀態：$msg"
                     prefs.edit().putString("last", msg).apply()
                 }

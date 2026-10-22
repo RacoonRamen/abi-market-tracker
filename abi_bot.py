@@ -88,28 +88,71 @@ def parse_utc(ts):
 
 
 def quote_time_for(minors):
-    """指定分類（可逗號分隔）的最新報價時間；有手機資料且涵蓋該分類時優先採手機"""
+    """指定分類（可逗號分隔）的最新報價時間；檢查所有要求分類的覆蓋率，取最舊分類時間確保完整度"""
     want = [m.strip() for m in str(minors).split(",") if m.strip()]
     if not want:
         return quote_source()
-    best = None
+    csv_by_m = {}
     try:
         with open(PRICES, encoding="utf-8-sig") as f:
             for r in csv.DictReader(f):
-                if (r.get("minor") or "").strip() in want:
+                m = (r.get("minor") or "").strip()
+                if m in want:
                     ts = (r.get("fetched_at_utc") or "").strip()
-                    if ts and (best is None or ts > best[0]):
-                        best = (ts, parse_utc(ts))
+                    if ts and (m not in csv_by_m or ts > csv_by_m[m][0]):
+                        csv_by_m[m] = (ts, parse_utc(ts))
     except OSError:
         pass
-    pt = best[1] if best else None
+
     ph = phone_prices() or {}
-    ids = [str(i.get("id")) for i in ph.get("items", [])]
-    if ids and any(any(i.startswith(w) for w in want) for i in ids):
-        t = phone_time()
-        if t and (pt is None or t > pt):
-            return t, "手機"
-    return pt, "GitHub"
+    top_t = phone_time()
+    cat_ts_map = ph.get("category_ts") or {}
+    ph_by_m = {}
+    for m in want:
+        cts = (cat_ts_map.get(m) or "").strip()
+        if cts:
+            dt = parse_utc(cts)
+            if dt:
+                ph_by_m[m] = dt
+                continue
+        # 相容舊格式：看 items 內是否有該 minor 或 id 以該 minor 開頭
+        best_it = None
+        for it in ph.get("items", []):
+            im = str(it.get("minor") or "").strip()
+            iid = str(it.get("id") or "")
+            if im == m or (not im and iid.startswith(m)):
+                its = (it.get("ts") or "").strip()
+                idt = parse_utc(its) if its else top_t
+                if idt and (best_it is None or idt > best_it):
+                    best_it = idt
+        if best_it:
+            ph_by_m[m] = best_it
+
+    # 計算每個分類的最佳時間與來源
+    per_m = []
+    phone_hit = 0
+    for m in want:
+        ct = csv_by_m.get(m, (None, None))[1]
+        pt = ph_by_m.get(m)
+        if pt and (ct is None or pt >= ct):
+            per_m.append((pt, "手機"))
+            phone_hit += 1
+        elif ct:
+            per_m.append((ct, "GitHub"))
+        else:
+            per_m.append((None, "無"))
+
+    valid_times = [t for t, _ in per_m if t is not None]
+    if not valid_times:
+        return None, "GitHub"
+
+    # 若要求多個分類，取當中最舊的時間作為整體有效時間（避免只抓 1/13 分類就誤判全部新鮮）
+    oldest_t = min(valid_times)
+    if phone_hit == len(want):
+        return oldest_t, "手機"
+    elif phone_hit > 0:
+        return oldest_t, f"手機({phone_hit}/{len(want)})+GitHub"
+    return oldest_t, "GitHub"
 
 
 def role_tag(guild):
@@ -211,20 +254,30 @@ def fmt(n):
     return f"{n:,.0f}"
 
 
-def dstamp(snap, minors=None):
-    """只顯示真實報價時間與來源，避免和快照時間混淆"""
+def fmt_quote_time(minors=None, now=None):
+    """統一時間格式: MM-DD HH:MM（N 分鐘前，來源 X）"""
     pt, src = quote_time_for(minors) if minors else quote_source()
     if not pt:
-        return "-# 尚無報價資料"
-    age = int((datetime.now(TAIPEI) - pt).total_seconds() // 60)
+        return None, "尚無報價資料", False
+    now = now or datetime.now(TAIPEI)
+    age = max(0, int((now - pt).total_seconds() // 60))
     if age < 120:
         ago = f"{age} 分鐘前"
     elif age < 2880:
         ago = f"{age // 60} 小時前"
     else:
         ago = f"{age // 1440} 天前"
-    warn = "⚠ 報價已停止更新　" if age >= 20 else ""
-    return f"-# {warn}報價時間 {pt.strftime('%m-%d %H:%M')}（{ago}，來源 {src}）"
+    stale = age >= 20
+    return pt, f"{pt.strftime('%m-%d %H:%M')}（{ago}，來源 {src}）", stale
+
+
+def dstamp(snap=None, minors=None):
+    """只顯示真實報價時間與來源，避免和快照時間混淆"""
+    pt, txt, stale = fmt_quote_time(minors)
+    if not pt:
+        return "-# 尚無報價資料"
+    warn = "⚠ 報價已停止更新　" if stale else ""
+    return f"-# {warn}報價時間 {txt}"
 
 
 def dwidth(s):
@@ -664,12 +717,13 @@ def _put_repo_file(name, text, message):
         return False
 
 
-def _request_phone(minor):
+def _request_phone(minor, mode="grid"):
     """請手機 App 抓一次（寫 scrape_request.json，手機每 20 秒檢查）"""
     rid = int(time.time())
+    payload = {"id": rid, "minor": minor or TV_MINOR, "mode": mode, "ts": rid}
     ok = _put_repo_file("scrape_request.json",
-                        json.dumps({"id": rid, "minor": minor or TV_MINOR, "ts": rid}),
-                        f"scrape request {rid}")
+                        json.dumps(payload, ensure_ascii=False),
+                        f"scrape request {rid} ({mode})")
     return rid if ok else None
 
 
@@ -686,10 +740,66 @@ _fresh_lock = asyncio.Lock()
 
 MISC_MINORS = "40801,40802,40803,40804,40805,40806,40807,40808,40809,40810,40812,40813,40814"
 _last_push = 0.0
+PHONE_HISTORY = os.path.join(HERE, "phone_history.json")
+
+
+def _merge_phone_history():
+    """若手機上傳了 phone_history.json，合併進 history.json（去重 recent、更新 day/week）"""
+    if not os.path.exists(PHONE_HISTORY):
+        return False
+    try:
+        ph_hist = load_json(PHONE_HISTORY, {}) or {}
+        items_data = ph_hist.get("items") or {}
+        if not items_data:
+            return False
+        old = load_json(HISTORY, {}) or {}
+        updated_at = ph_hist.get("fetched_at") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        changed = False
+        for item_id, data in items_data.items():
+            iid = str(item_id)
+            rec = old.get(iid, {"recent": []})
+            new_rows = data.get("recent") or []
+            # 轉成統一 [iso_ts, price, qty] 格式
+            parsed_recent = []
+            for r in new_rows:
+                if isinstance(r, list) and len(r) >= 2:
+                    s0 = str(r[0])
+                    if "(UTC" in s0:
+                        import re as _re
+                        m = _re.match(r"([\d-]+ [\d:]+) \(UTC \+8\)", s0)
+                        p = _re.sub(r"[^0-9]", "", str(r[1]))
+                        q = _re.sub(r"[^0-9]", "", str(r[2])) if len(r) > 2 else "0"
+                        if m and p:
+                            parsed_recent.append([m.group(1).replace(" ", "T") + "+08:00", int(p), int(q or 0)])
+                    else:
+                        try:
+                            parsed_recent.append([s0, int(r[1]), int(r[2]) if len(r) > 2 else 0])
+                        except Exception:
+                            pass
+            new_ts = {r[0] for r in parsed_recent}
+            merged = [r for r in rec.get("recent", []) if r[0] not in new_ts] + parsed_recent
+            merged.sort(key=lambda x: x[0])
+            day = data.get("day") if data.get("day") else rec.get("day", [])
+            week = data.get("week") if data.get("week") else rec.get("week", [])
+            if day or week or parsed_recent:
+                old[iid] = {
+                    "updated": updated_at,
+                    "recent": merged[-500:],
+                    "day": day,
+                    "week": week,
+                }
+                changed = True
+        if changed:
+            save_json(HISTORY, old)
+        return changed
+    except Exception as e:
+        print("merge phone history fail:", e)
+        return False
 
 
 def _rebuild_models():
     """用最新的 phone_prices.json 重算 snapshot 與 forecast（在 VM 上執行，純 Python）"""
+    _merge_phone_history()
     py = sys.executable
     env_note = []
     try:
@@ -717,7 +827,8 @@ def _push_data(force=False):
     if not force and time.time() - _last_push < 600:
         return
     tok = _gh_token()
-    files = ["snapshot.json", "forecast.json", "dashboard.html", "tv_keys.html", "phone_prices.json"]
+    files = [f for f in ["snapshot.json", "forecast.json", "dashboard.html", "tv_keys.html", "phone_prices.json", "history.json"]
+             if os.path.exists(os.path.join(HERE, f))]
     try:
         subprocess.run(["git", "-C", HERE, "add"] + files, capture_output=True, timeout=60)
         if subprocess.run(["git", "-C", HERE, "diff", "--cached", "--quiet"]).returncode == 0:
@@ -729,8 +840,9 @@ def _push_data(force=False):
         subprocess.run(["git", "-C", HERE, "fetch", "-q", "origin", "main"], capture_output=True, timeout=60)
         subprocess.run(["git", "-C", HERE, "rebase", "-X", "ours", "origin/main", "-q"],
                        capture_output=True, timeout=60)
-        url = f"https://x-access-token:{tok}@github.com/{GH_REPO}.git" if tok else "origin"
-        r = subprocess.run(["git", "-C", HERE, "push", "-q", url, "HEAD:main"],
+        # 優先使用 deploy key，否則退回 PAT 或 origin
+        target = "deploy" if _deploy_key_ok() else (f"https://x-access-token:{tok}@github.com/{GH_REPO}.git" if tok else "origin")
+        r = subprocess.run(["git", "-C", HERE, "push", "-q", target, "HEAD:main"],
                            capture_output=True, timeout=90)
         if r.returncode == 0:
             _last_push = time.time()
@@ -738,9 +850,41 @@ def _push_data(force=False):
         print("push data fail:", e)
 
 
-async def _ensure_fresh(ctx, minor, label, timeout=75):
+class _SkipWaitView(discord.ui.View):
+    """提供使用者在等待手機回報時，隨時按按鈕直接看舊資料"""
+    def __init__(self, timeout=180):
+        super().__init__(timeout=timeout)
+        self.skipped = False
+
+    @discord.ui.button(label="⏩ 不等了，直接看舊資料", style=discord.ButtonStyle.secondary)
+    async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.skipped = True
+        button.disabled = True
+        button.label = "⏩ 已切換為直接顯示舊資料"
+        try:
+            await interaction.response.edit_message(view=self)
+        except Exception:
+            pass
+        self.stop()
+
+
+def calc_timeout(minor_str, explicit_timeout=None):
+    """根據請求分類數量動態計算等待上限（1分類=75s, 13分類=160s）"""
+    if explicit_timeout is not None:
+        return explicit_timeout
+    minors = [m.strip() for m in str(minor_str or TV_MINOR).split(",") if m.strip()]
+    return max(75, 30 + len(minors) * 10)
+
+
+async def _ensure_fresh(ctx, minor, label, timeout=None, force_old=False, mode="grid"):
     """資料新鮮就秒回；否則請手機 App 抓一次並等它上傳。
+    force_old=True 時直接跳過抓取，立即使用現有資料。
     回 True = 資料已是最新；False = 沿用上次資料（訊息會說明原因）"""
+    if force_old:
+        return False
+
+    wait_sec = calc_timeout(minor, timeout)
+
     def age_now():
         """依請求的分類判斷新鮮度（phone_prices 內是否已涵蓋這些 minor）"""
         pt, src = quote_time_for(minor or TV_MINOR)
@@ -748,15 +892,17 @@ async def _ensure_fresh(ctx, minor, label, timeout=75):
             return 1e9, None, src
         return (datetime.now(TAIPEI) - pt).total_seconds(), pt, src
 
-    age, pt, src = age_now()
-    if age <= FRESH_WINDOW:
-        return True
-
-    async with _fresh_lock:
+    if mode == "grid":
         age, pt, src = age_now()
         if age <= FRESH_WINDOW:
             return True
-        rid = await asyncio.to_thread(_request_phone, minor)
+
+    async with _fresh_lock:
+        if mode == "grid":
+            age, pt, src = age_now()
+            if age <= FRESH_WINDOW:
+                return True
+        rid = await asyncio.to_thread(_request_phone, minor, mode)
         if not rid:
             grace = time.monotonic() + 15
             while time.monotonic() < grace:
@@ -766,22 +912,44 @@ async def _ensure_fresh(ctx, minor, label, timeout=75):
                 if age <= FRESH_WINDOW:
                     await asyncio.to_thread(_rebuild_models)
                     return True
-            age, pt, _ = age_now()
-            how = "剛剛" if age < 60 else f"{int(age // 60)} 分鐘前"
-            await ctx.send(f"⚠ 無法叫手機抓資料（{LAST_PUT_ERR or _pat_ok()}）；"
-                           f"以下是目前最新的 {how}資料")
+            _, qtxt, _ = fmt_quote_time(minor or TV_MINOR)
+            await ctx.send(f"⚠ 無法寫入請求叫手機抓資料（原因：`{LAST_PUT_ERR or _pat_ok()}`，請打 `!diag` 檢查）；\n"
+                           f"以下先顯示目前舊資料（{qtxt}）：")
             return False
-        await ctx.send(f"📲 向手機要資料中（{label}）…")
-        deadline = time.monotonic() + timeout
+
+        skip_view = _SkipWaitView(timeout=wait_sec)
+        wait_msg = await ctx.send(
+            f"📲 向手機請求資料中（**{label}**，單號 `#{rid}`，預計上限 {wait_sec} 秒）…\n"
+            f"-# 若不想等待可點擊下方按鈕，或下次輸入 `!top old` 直接看舊資料",
+            view=skip_view)
+        deadline = time.monotonic() + wait_sec
         while time.monotonic() < deadline:
+            if skip_view.skipped:
+                await ctx.send("⏩ 已略過等待，以下使用目前最新快照資料：")
+                return False
             await asyncio.sleep(5)
+            if skip_view.skipped:
+                await ctx.send("⏩ 已略過等待，以下使用目前最新快照資料：")
+                return False
             await asyncio.to_thread(_pull)
+            ph = phone_prices() or {}
+            ph_req = int(ph.get("req") or 0)
             age, pt, src = age_now()
-            if age <= 60:
+            if ph_req >= rid or (mode == "grid" and age <= 60):
                 await asyncio.to_thread(_rebuild_models)
                 await asyncio.to_thread(_push_data)
+                try:
+                    await wait_msg.edit(content=f"✅ 手機已回報最新資料（**{label}**，單號 `#{rid}`）！", view=None)
+                except Exception:
+                    pass
                 return True
-        await ctx.send("⚠ 手機 75 秒內沒有回報（App 是否還在待命？）以下是上次資料")
+        try:
+            await wait_msg.edit(view=None)
+        except Exception:
+            pass
+        _, qtxt, _ = fmt_quote_time(minor or TV_MINOR)
+        await ctx.send(f"⚠ 手機在 {wait_sec} 秒內未完成回報（單號 `#{rid}`，請打 `!diag` 檢查哪一端卡住）；\n"
+                       f"以下先用舊資料計算（{qtxt}）：")
         return False
 
 
@@ -809,9 +977,13 @@ class AbiBot(commands.Bot):
                 if not p:
                     continue
                 try:
-                    it["low"] = int(p.get("low") or it["low"])
-                    if p.get("count"):
+                    low = int(p.get("low") or it["low"])
+                    it["low"] = low
+                    if p.get("count") and int(p.get("count") or 0) > 0:
                         it["count"] = int(p["count"])
+                    # 即時同步更新 score，避免記憶體覆蓋 low 後仍沿用舊推薦分
+                    if not it.get("turnover"):
+                        it["score"] = int((low * (1 - 0.065)) / math.log10(2 + (it.get("count") or 0)))
                     it["src"] = "phone"
                 except Exception:
                     pass
@@ -898,14 +1070,10 @@ def daily_brief_text(snap, role=""):
     tv.sort(key=lambda i: i["low"] / i["buy_price"])
     now = datetime.now(TAIPEI)
     head = "☀️ **早報**" if now.hour < 12 else "🌙 **晚間快報**"
-    pt, src = quote_source()
+    pt, qtxt, stale = fmt_quote_time(TV_MINOR, now)
     if pt:
-        age = int((now - pt).total_seconds() // 60)
-        ago = f"{age} 分鐘前" if age < 120 else (
-            f"{age // 60} 小時前" if age < 2880 else f"{age // 1440} 天前")
-        warn = "　⚠ 報價已停止更新" if age >= 20 else ""
-        lines = [f"{head} {now.strftime('%H:%M')}　報價 {pt.strftime('%m-%d %H:%M')}"
-                 f"（{ago}，來源 {src}）{warn}", ""]
+        warn = "　⚠ 報價已停止更新" if stale else ""
+        lines = [f"{head} {now.strftime('%H:%M')}　報價 {qtxt}{warn}", ""]
     else:
         lines = [f"{head} {now.strftime('%H:%M')}", ""]
 
@@ -949,9 +1117,10 @@ def daily_brief_text(snap, role=""):
     return "\n".join(lines)
 
 
-def alert_view(lines, generated):
+def alert_view(lines, generated=""):
     """Components V2 卡片; 失敗時回 None 改用純文字"""
     try:
+        _, qtxt, _ = fmt_quote_time(TV_MINOR)
         cont = discord.ui.Container(accent_color=discord.Color.gold())
         cont.add_item(discord.ui.TextDisplay("## 🔑 電視台鑰匙訊號更新"))
         cont.add_item(discord.ui.Separator())
@@ -959,7 +1128,7 @@ def alert_view(lines, generated):
             cont.add_item(discord.ui.TextDisplay(ln))
         cont.add_item(discord.ui.Separator())
         cont.add_item(discord.ui.TextDisplay(
-            f"-# 資料時間 {generated} · 補貨價=每日最低價P25 · 深跌價=30天絕對低×1.03"))
+            f"-# 報價時間 {qtxt} · 補貨價=每日最低價P25 · 深跌價=30天絕對低×1.03"))
         v = discord.ui.LayoutView()
         v.add_item(cont)
         return v
@@ -999,19 +1168,102 @@ def _pat_ok():
         return {401: "token 無效", 403: "權限不足", 404: "repo 不存在"}.get(e.code, f"HTTP {e.code}")
     except Exception as e:
         return f"連線失敗（{type(e).__name__}）"
-async def status_cmd(ctx):
-    pt, src = quote_source()
-    age = int((datetime.now(TAIPEI) - pt).total_seconds() // 60) if pt else -1
+def build_diag_report():
+    """產生 GCP ↔ GitHub ↔ 手機 四節點全鏈路診斷文字"""
+    now = datetime.now(TAIPEI)
+    pat_st = _pat_ok()
+    dep_ok = _deploy_key_ok()
+    write_ok = ("OK" in pat_st) or dep_ok
+    w_icon = "🟢" if write_ok else "🔴"
+
     req = load_json(os.path.join(HERE, "scrape_request.json"), {}) or {}
+    req_id = int(req.get("id") or 0)
+    req_minor = req.get("minor", "-")
+    req_age = int(time.time() - req_id) if req_id > 1000000000 else -1
+
+    ph = phone_prices() or {}
+    ph_req = int(ph.get("req") or 0)
+    ph_ver = ph.get("app_version") or ("<v1.6 (舊版會洗掉分類!)" if ph else "-")
+    pt = phone_time()
+    ph_age = int((now - pt).total_seconds()) if pt else -1
+
+    if req_id > 0 and ph_req >= req_id:
+        p_icon = "🟢"
+        p_msg = f"正常（已回報最新請求 `#{ph_req}`，{ph_age // 60 if ph_age >= 0 else '?'} 分鐘前）"
+    elif req_id > 0 and req_age > 180 and ph_req < req_id:
+        p_icon = "🔴"
+        p_msg = f"手機未回報！請求 `#{req_id}` 已發出 {req_age // 60} 分鐘，手機仍停在 `#{ph_req}`"
+    elif pt and ph_age < 3600:
+        p_icon = "🟡"
+        p_msg = f"待命中（最後上傳 `#{ph_req}`，{ph_age // 60} 分鐘前）"
+    else:
+        p_icon = "🔴" if not pt else "🟡"
+        p_msg = f"無近期回報（最後上傳：{pt.strftime('%m-%d %H:%M') if pt else '無'}，單號 `#{ph_req}`）"
+
+    # 分類覆蓋率與新鮮度
+    _, tv_txt, tv_stale = fmt_quote_time(TV_MINOR, now)
+    _, misc_txt, misc_stale = fmt_quote_time(MISC_MINORS, now)
+    misc_list = [m.strip() for m in MISC_MINORS.split(",") if m.strip()]
+    cat_ts = ph.get("category_ts") or {}
+    ph_items = ph.get("items") or []
+    covered_misc = sum(
+        1 for m in misc_list
+        if m in cat_ts or any(str(i.get("minor") or "") == m or str(i.get("id") or "").startswith(m) for i in ph_items)
+    )
+
+    # 歷史與模型一致性檢查
+    hist = load_json(HISTORY, {}) or {}
+    hist_dates = [r[0].split(" ")[0] for h in hist.values() for r in (h.get("day") or []) if r]
+    max_hdate = max(hist_dates) if hist_dates else "無"
+    today_s = now.strftime("%Y-%m-%d")
+
+    snap_raw = load_json(SNAPSHOT, {}) or {}
+    snap_by_id = {str(i.get("id")): i for i in snap_raw.get("items", [])}
+    mismatches = 0
+    for it in ph_items:
+        sid = str(it.get("id"))
+        if sid in snap_by_id and int(it.get("low") or 0) > 0:
+            if int(snap_by_id[sid].get("low") or 0) != int(it["low"]):
+                mismatches += 1
+    sync_icon = "🟢" if mismatches == 0 else "🟡"
+
     lines = [
-        f"🖥 主機：GCP key-slave（bot 常駐）",
-        f"📊 報價來源：**{src}**" + (f"，{age} 分鐘前" if age >= 0 else "（無資料）"),
-        f"🔑 VM PAT：**{_pat_ok()}**" + (f"（上次寫入失敗：{LAST_PUT_ERR}）" if LAST_PUT_ERR else ""),
-        "🔐 Deploy key：**" + ("OK" if _deploy_key_ok() else "未設定（無法推送）") + "**",
-        f"📲 手機請求：`{req.get('id', '-')}`（minor {req.get('minor', '-')}）",
-        f"📁 快照：{load_json(SNAPSHOT, {}).get('generated', '-')}",
+        "🔍 **ABI 全鏈路診斷報告 (`!diag`)**",
+        f"**[1] GCP VM ──▶ GitHub (寫入請求權限)**",
+        f"　{w_icon} PAT：`{pat_st}` ｜ Deploy Key：`{'OK' if dep_ok else '未設定'}`"
+        + (f"\n　⚠ 上次寫入錯誤：`{LAST_PUT_ERR}`" if LAST_PUT_ERR else ""),
+        f"　└ 最後請求單號：`#{req_id or '-'}`（分類 `{req_minor[:24]}{'…' if len(str(req_minor)) > 24 else ''}`"
+        + (f"，{req_age // 60} 分鐘前）" if req_age >= 0 else "）"),
+        f"**[2] GitHub ◀──▶ Android 手機 (接單與回報)**",
+        f"　{p_icon} {p_msg}",
+        f"　└ App 版本：`{ph_ver}` ｜ 手機端快取商品數：`{len(ph_items)}` 項",
+        f"**[3] 各分類資料新鮮度（為何有些新、有些舊？）**",
+        f"　{'🟢' if not tv_stale else '🟡'} 鑰匙 (`40505`)：{tv_txt}",
+        f"　{'🟢' if covered_misc == len(misc_list) and not misc_stale else '🟡'} 雜物 (`408xx`)：{misc_txt}（手機涵蓋 `{covered_misc}/{len(misc_list)}` 分類）",
+        f"　{'🟢' if max_hdate >= today_s else '🟡'} 歷史日線 (`history.json`)：最新到 `{max_hdate}`"
+        + ("（可用 `!refresh history` 叫手機補抓）" if max_hdate < today_s else ""),
+        f"**[4] 快照與模型同步 (`phone_prices` vs `snapshot.json`)**",
+        f"　{sync_icon} " + ("100% 同步一致" if mismatches == 0 else f"有 `{mismatches}` 筆尚未寫入靜態 snapshot.json（記憶體已即時覆蓋）"),
     ]
-    await ctx.send("\n".join(lines))
+    if not write_ok:
+        lines.append("\n💡 **修復建議**：VM 無法寫入 GitHub，請將 Deploy Key 加入 GitHub Repo Settings 並勾選 Allow write access。")
+    elif p_icon == "🔴":
+        lines.append("\n💡 **修復建議**：GCP 已成功寫出請求，但手機沒回應。請確認手機 App 已點「啟動監聽」、已給懸浮窗權限、且升級至 v1.6。")
+    elif covered_misc < len(misc_list):
+        lines.append("\n💡 **原因說明**：目前 `phone_prices.json` 缺少部分雜物分類（舊版 App 抓鑰匙時會洗掉雜物）。請升級手機 App 至 v1.6 並打一次 `!top` 即可永久保留。")
+    return "\n".join(lines)
+
+
+@bot.command(name="status", brief="系統與三端鏈路狀態檢查",
+              description="檢查 GCP 主機、GitHub 寫入權限、手機回報狀態與各分類新鮮度。\n例: !status")
+async def status_cmd(ctx):
+    await ctx.send(build_diag_report())
+
+
+@bot.command(name="diag", brief="全鏈路深度診斷（同 !status）",
+              description="檢查 GCP ↔ GitHub ↔ 手機 哪一端異常，以及各分類資料新鮮度與一致性。\n例: !diag")
+async def diag_cmd(ctx):
+    await ctx.send(build_diag_report())
 
 
 
@@ -1034,10 +1286,31 @@ def pick_line(i):
             f"({dist:+.1f}%) {tag}")
 
 
+def _parse_top_args(arg1, arg2):
+    """解析 !top [n] [old] 或 !top old，回傳 (n, force_old)"""
+    n = 20
+    force_old = False
+    for a in (arg1, arg2):
+        if a is None:
+            continue
+        s = str(a).strip().lower()
+        if not s:
+            continue
+        if s in ("old", "skip", "cache", "舊", "舊資料"):
+            force_old = True
+        elif s.isdigit():
+            n = int(s)
+    return max(1, min(n, 25)), force_old
+
+
+def _is_old_flag(arg):
+    return str(arg or "").strip().lower() in ("old", "skip", "cache", "舊", "舊資料")
+
+
 @bot.command(name="keys", brief="電視台鑰匙補貨推薦表",
-              description="列出 18 把鑰匙的現價、補貨價（P25）、深跌價（歷史地板×1.03）與距補貨 %，並標出最推薦購買。\n會先自動重抓鑰匙分類（約 1~3 分鐘）。\n例: !keys")
-async def keys_cmd(ctx):
-    await _ensure_fresh(ctx, TV_MINOR, "電視台鑰匙")
+              description="列出 18 把鑰匙的現價、補貨價（P25）、深跌價（歷史地板×1.03）與距補貨 %，並標出最推薦購買。\n加 old 可直接看舊資料不等待。\n例: !keys / !keys old")
+async def keys_cmd(ctx, flag: str = ""):
+    await _ensure_fresh(ctx, TV_MINOR, "電視台鑰匙", force_old=_is_old_flag(flag))
     snap = bot.snapshot()
     pool = bot.tv_items()
     rows = [["鑰匙", "現價", "補貨價", "深跌價", "距補貨", "狀態"]]
@@ -1048,30 +1321,30 @@ async def keys_cmd(ctx):
         rows.append([i["name"], fmt(i["low"]), fmt(i["buy_price"]), fmt(i.get("deep_buy", 0)),
                      f"{dist:+.1f}%", SIG_TXT[sig_of(i)]])
     await ctx.send(pick_line(best_pick(pool)) + "\n🔑 **電視台鑰匙補貨推薦**\n```\n"
-                   + table(rows)[:1800] + "\n```\n" + dstamp(snap) + low_tag(snap, ctx.guild))
+                   + table(rows)[:1800] + "\n```\n" + dstamp(snap, TV_MINOR) + low_tag(snap, ctx.guild))
 
 
 @bot.command(name="chart30", brief="30天每日價格區間圖",
-              description="電視台鑰匙近 30 天每日高低區間＋現價/補貨價線（圖片）。\n會先自動重抓。\n例: !chart30")
-async def chart30_cmd(ctx):
-    await _send_bands(ctx, "day30")
+              description="電視台鑰匙近 30 天每日高低區間＋現價/補貨價線（圖片）。\n例: !chart30 / !chart30 old")
+async def chart30_cmd(ctx, flag: str = ""):
+    await _send_bands(ctx, "day30", force_old=_is_old_flag(flag))
 
 
 @bot.command(name="chart100", brief="近100天每週價格區間圖",
-              description="電視台鑰匙近 100 天每週高低區間（圖片）。\n會先自動重抓。\n例: !chart100")
-async def chart100_cmd(ctx):
-    await _send_bands(ctx, "weeks")
+              description="電視台鑰匙近 100 天每週高低區間（圖片）。\n例: !chart100 / !chart100 old")
+async def chart100_cmd(ctx, flag: str = ""):
+    await _send_bands(ctx, "weeks", force_old=_is_old_flag(flag))
 
 
 @bot.command(name="chart", brief="鑰匙總覽圖（= !chart30）",
-              description="同 !chart30。\n例: !chart")
-async def chart_cmd(ctx):
-    await _send_bands(ctx, "day30")  # 別名: 同 !chart30
+              description="同 !chart30。\n例: !chart / !chart old")
+async def chart_cmd(ctx, flag: str = ""):
+    await _send_bands(ctx, "day30", force_old=_is_old_flag(flag))  # 別名: 同 !chart30
 
 
-async def _send_bands(ctx, mode):
+async def _send_bands(ctx, mode, force_old=False):
     await ctx.typing()
-    await _ensure_fresh(ctx, TV_MINOR, "電視台鑰匙")
+    await _ensure_fresh(ctx, TV_MINOR, "電視台鑰匙", force_old=force_old)
     os.makedirs(CHART_DIR, exist_ok=True)
     snap = bot.snapshot()
     pool = bot.tv_items()
@@ -1080,8 +1353,8 @@ async def _send_bands(ctx, mode):
     fname = "tv_overview_30.png" if mode == "day30" else "tv_overview_100.png"
     path = tv_overview_png(pool, os.path.join(CHART_DIR, fname), mode)
     head = pick_line(best_pick(pool))
-    await ctx.send(head + "\n🔑 **電視台鑰匙 30 天每日區間**\n" + dstamp(snap) if mode == "day30"
-                   else head + "\n🔑 **電視台鑰匙 近 100 天週區間**\n" + dstamp(snap), file=discord.File(path))
+    await ctx.send(head + "\n🔑 **電視台鑰匙 30 天每日區間**\n" + dstamp(snap, TV_MINOR) if mode == "day30"
+                   else head + "\n🔑 **電視台鑰匙 近 100 天週區間**\n" + dstamp(snap, TV_MINOR), file=discord.File(path))
 
 
 @bot.command(name="sell", brief="全站賣出推薦 Top15",
@@ -1171,9 +1444,9 @@ def forecast_png(rows, out_path, title):
     return out_path
 
 
-async def _top_misc(ctx, rarity, kind, color, n=20):
-    """雜物指定稀有度 TopN (rarity=None 全部), 例: !topg 10"""
-    await _ensure_fresh(ctx, MISC_MINORS, "雜物")
+async def _top_misc(ctx, rarity, kind, color, n=20, force_old=False):
+    """雜物指定稀有度 TopN (rarity=None 全部), 例: !topg 10 或 !top old"""
+    await _ensure_fresh(ctx, MISC_MINORS, "雜物", force_old=force_old)
     n = max(1, min(n, 25))
     label = f"{kind}色雜物" if kind else "雜物"
     snap = bot.snapshot()
@@ -1211,34 +1484,45 @@ async def _top_misc(ctx, rarity, kind, color, n=20):
 
 
 @bot.command(name="top", brief="雜物賣出推薦 Top（圖片表）",
-              description="雜物大類全部稀有度的推薦 Top（圖片表格，畫不出來自動退回文字）。\n例: !top / !top 10（1~25）")
-async def top_cmd(ctx, n: int = 20):
-    await _top_misc(ctx, None, "", 0xf0b429, n)
+              description="雜物大類全部稀有度的推薦 Top（圖片表格）。\n加 old 可略過等待直接看舊資料。\n例: !top / !top 10 / !top old / !top 15 old")
+async def top_cmd(ctx, arg1: str = None, arg2: str = None):
+    n, force_old = _parse_top_args(arg1, arg2)
+    await _top_misc(ctx, None, "", 0xf0b429, n, force_old)
 
 
 @bot.command(name="topg", brief="金色雜物賣出推薦 Top（圖片表）",
-              description="只看稀有度 5.0（金）的雜物（圖片表格）。\n例: !topg / !topg 10")
-async def topg_cmd(ctx, n: int = 20):
-    await _top_misc(ctx, 5.0, "金", 0xf0b429, n)
+              description="只看稀有度 5.0（金）的雜物（圖片表格）。\n例: !topg / !topg 10 / !topg old")
+async def topg_cmd(ctx, arg1: str = None, arg2: str = None):
+    n, force_old = _parse_top_args(arg1, arg2)
+    await _top_misc(ctx, 5.0, "金", 0xf0b429, n, force_old)
 
 
 @bot.command(name="topp", brief="紫色雜物賣出推薦 Top（圖片表）",
-              description="只看稀有度 4.0（紫）的雜物（圖片表格）。\n例: !topp / !topp 10")
-async def topp_cmd(ctx, n: int = 20):
-    await _top_misc(ctx, 4.0, "紫", 0x9b59b6, n)
+              description="只看稀有度 4.0（紫）的雜物（圖片表格）。\n例: !topp / !topp 10 / !topp old")
+async def topp_cmd(ctx, arg1: str = None, arg2: str = None):
+    n, force_old = _parse_top_args(arg1, arg2)
+    await _top_misc(ctx, 4.0, "紫", 0x9b59b6, n, force_old)
 
 
 @bot.command(name="topb", brief="藍色雜物賣出推薦 Top（圖片表）",
-              description="只看稀有度 3.0（藍）的雜物（圖片表格）。\n例: !topb / !topb 10")
-async def topb_cmd(ctx, n: int = 20):
-    await _top_misc(ctx, 3.0, "藍", 0x4d9fff, n)
+              description="只看稀有度 3.0（藍）的雜物（圖片表格）。\n例: !topb / !topb 10 / !topb old")
+async def topb_cmd(ctx, arg1: str = None, arg2: str = None):
+    n, force_old = _parse_top_args(arg1, arg2)
+    await _top_misc(ctx, 3.0, "藍", 0x4d9fff, n, force_old)
 
 
-@bot.command(name="refresh", brief="手動整套重抓",
-              description="觸發 GitHub 全站重抓（約 3~4 分鐘），完成後下指令即是新資料。\n例: !refresh")
-async def refresh_cmd(ctx):
-    """手動整套重抓（約 3~4 分鐘），例: !refresh"""
-    await _ensure_fresh(ctx, "", "全站資料", timeout=600)
+@bot.command(name="refresh", brief="手動重抓（支援 history 補歷史）",
+              description="觸發手機重抓。預設重抓鑰匙與雜物；`!refresh history` 會叫手機展開詳情頁補抓 30 天歷史日線與在售數量。\n例: !refresh / !refresh history")
+async def refresh_cmd(ctx, target: str = ""):
+    t = (target or "").strip().lower()
+    if t in ("history", "hist", "歷史"):
+        await _ensure_fresh(ctx, TV_MINOR, "電視台鑰匙 30天歷史與在售量", timeout=240, mode="history")
+    elif t in ("keys", "key", "40505", "鑰匙"):
+        await _ensure_fresh(ctx, TV_MINOR, "電視台鑰匙", timeout=90)
+    elif t in ("misc", "top", "雜物"):
+        await _ensure_fresh(ctx, MISC_MINORS, "13類雜物", timeout=180)
+    else:
+        await _ensure_fresh(ctx, f"{TV_MINOR},{MISC_MINORS}", "鑰匙＋13類雜物", timeout=240)
 
 
 @bot.command(name="price", brief="單品評估卡＋30天圖",
@@ -1282,7 +1566,7 @@ async def price_cmd(ctx, *, query=""):
                 files.append(discord.File(fp))
             except Exception as e:
                 print("chart fail:", e)
-        emb.set_footer(text=f"資料時間 {snap.get('generated', '')}")
+        emb.set_footer(text=dstamp(snap, minor).replace("-# ", ""))
         await ctx.send(embed=emb, files=files)
 
 
@@ -1361,19 +1645,17 @@ def forecast_caption(fc, items, band, period_label, cur_time=None, cur_src=None,
                    max(e.get("w_to", "") for e in items),
                    max(e.get("w_n", 0) for e in items))
         basis = f"{f} ~ {t}（{n} 週每週最低價）"
-    lines.append(f"-# 依據 {basis} · 預估於 {fc.get('generated', '')}")
-    if cur_time:
-        lines.append(f"-# 現價時間 {cur_time.strftime('%m-%d %H:%M')}"
-                     f"（{cur_src}）· 目標 {tgt}")
+    _, qtxt, _ = fmt_quote_time(TV_MINOR)
+    lines.append(f"-# 依據 {basis} · 報價時間 {qtxt}")
     today = datetime.now(TAIPEI).strftime("%Y-%m-%d")
     if t and t < today:
-        lines.append(f"-# ⚠ 歷史只到 {t}，今日（{today[5:]}）尚未納入模型")
+        lines.append(f"-# ⚠ 歷史只到 {t}，今日（{today[5:]}）尚未納入模型（可用 `!refresh history` 補抓）")
     lines.append("-# 金帶=預估區間, 綠點=通道內, 紅點=偏離")
     return "\n".join(lines)
 
 
-async def _send_forecast(ctx, band, period_label, fname):
-    await _ensure_fresh(ctx, TV_MINOR, "電視台鑰匙")
+async def _send_forecast(ctx, band, period_label, fname, force_old=False):
+    await _ensure_fresh(ctx, TV_MINOR, "電視台鑰匙", force_old=force_old)
     fc = load_json(os.path.join(HERE, "forecast.json"), {}) or {}
     # 用 history.json + 目前報價即時重算，避免 forecast.json 放久變舊
     tv_ids = None
@@ -1427,21 +1709,21 @@ async def _send_forecast(ctx, band, period_label, fname):
 
 
 @bot.command(name="forecast", brief="明日最低價預估（圖）",
-             description="用近 30 天每日最低價推估「明天」的價格區間（圖片＋白話摘要）。\n例: !forecast")
-async def forecast_cmd(ctx):
-    await _send_forecast(ctx, "d1", "明日", "forecast_30.png")
+             description="用近 30 天每日最低價推估「明天」的價格區間（圖片＋白話摘要）。\n例: !forecast / !forecast old")
+async def forecast_cmd(ctx, flag: str = ""):
+    await _send_forecast(ctx, "d1", "明日", "forecast_30.png", force_old=_is_old_flag(flag))
 
 
 @bot.command(name="forecast30", brief="明日最低價預估（30天日線）",
-             description="用近 30 天每日最低價推估明天的最低價區間，附圖表與白話摘要。\n例: !forecast30")
-async def forecast30_cmd(ctx):
-    await _send_forecast(ctx, "d1", "明日", "forecast_30.png")
+             description="用近 30 天每日最低價推估明天的最低價區間，附圖表與白話摘要。\n例: !forecast30 / !forecast30 old")
+async def forecast30_cmd(ctx, flag: str = ""):
+    await _send_forecast(ctx, "d1", "明日", "forecast_30.png", force_old=_is_old_flag(flag))
 
 
 @bot.command(name="forecast100", brief="下週最低價預估（100天週線）",
-             description="用近 100 天每週最低價推估下週的最低價區間，樣本長、波動估得較寬。\n例: !forecast100")
-async def forecast100_cmd(ctx):
-    await _send_forecast(ctx, "w1", "下週", "forecast_100.png")
+             description="用近 100 天每週最低價推估下週的最低價區間，樣本長、波動估得較寬。\n例: !forecast100 / !forecast100 old")
+async def forecast100_cmd(ctx, flag: str = ""):
+    await _send_forecast(ctx, "w1", "下週", "forecast_100.png", force_old=_is_old_flag(flag))
 
 
 @bot.command(name="brief", brief="現在該買什麼（快報）",
@@ -1482,8 +1764,9 @@ async def stopalert(ctx):
     await ctx.send("✅ 警示已停止")
 
 
-BOT_VERSION = "v2.4"
+BOT_VERSION = "v2.5"
 BOT_CHANGELOG = (
+    "v2.5 (2026-10-22): 新增 !diag 全鏈路診斷、動態等待時間與「先看舊資料」按鈕/old參數、防跨分類覆蓋、支援手機抓歷史\n"
     "v2.4 (2026-10-20): 圖表標示現價/進貨價差距%, 指令自動重抓對應分類, 每則訊息標資料時間\n"
     "v2.3 (2026-10-19): !topg/!topp/!topb 稀有度分級（金/紫/藍）圖片表\n"
     "v2.2 (2026-10-19): 按需抓取（dispatch 指定分類）+ !refresh\n"

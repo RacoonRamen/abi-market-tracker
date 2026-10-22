@@ -11,8 +11,8 @@ android {
         applicationId = "com.keyslave.abi"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "1.5"
+        versionCode = 6
+        versionName = "1.6"
     }
 
     buildTypes {
