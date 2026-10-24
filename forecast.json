@@ -1,9 +1,9 @@
 {
- "generated": "2026-10-24 23:58 台北",
- "target_date": "2026-10-25",
- "target_label": "10/25（週日）",
- "week_target_date": "2026-10-31",
- "week_target_label": "10/31（週六）",
+ "generated": "2026-10-25 00:33 台北",
+ "target_date": "2026-10-26",
+ "target_label": "10/26（週一）",
+ "week_target_date": "2026-11-01",
+ "week_target_label": "11/1（週日）",
  "method": "mean-reversion channel + half-slope drift",
  "items": {
   "405050901": {
