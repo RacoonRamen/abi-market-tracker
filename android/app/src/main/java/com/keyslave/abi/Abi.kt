@@ -15,6 +15,9 @@ import android.os.Environment
 import android.provider.Settings
 import android.view.Gravity
 import android.view.WindowManager
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.*
@@ -33,7 +36,7 @@ private const val REPO = "RacoonRamen/abi-market-tracker"
 private const val MARKET_URL = "https://abi-tracker.azurewebsites.net/Market/View?minorId=40505"
 private const val PREFS = "abi"
 private const val CHANNEL = "abi_price"
-private const val APP_VER = "1.7"
+private const val APP_VER = "1.8"
 
 private val EXTRACT_JS = """
 (function(){
@@ -183,26 +186,34 @@ object Scrape {
         if (minors.isEmpty()) { cb("未指定分類"); return }
         val all = JSONArray()
         val histAll = JSONObject()
+        val failed = ArrayList<String>()
+        val errs = ArrayList<String>()
         val wantHist = (mode == "history")
         val lock = Any()
         var nextIdx = 0
         val workers = if (wantHist) 1 else minOf(3, minors.size)
         var activeWorkers = workers
 
-        fun launchWorker() {
-            val m: String
-            synchronized(lock) {
+        fun launchWorker(retryMinor: String? = null, attempt: Int = 0) {
+            val m = retryMinor ?: synchronized(lock) {
                 if (nextIdx >= minors.size) {
                     activeWorkers--
                     if (activeWorkers == 0) {
-                        if (all.length() == 0) cb("沒有解析到任何價格")
-                        else upload(ctx, all, histAll, reqId, minors, cb)
+                        val why = if (errs.isEmpty()) "" else "（${errs.distinct().joinToString("；")}）"
+                        if (all.length() == 0) cb("沒有解析到任何價格$why")
+                        else upload(ctx, all, histAll, reqId, minors) { msg ->
+                            cb(if (failed.isEmpty()) msg else "$msg；未取得分類：${failed.joinToString(",")}$why")
+                        }
                     }
                     return
                 }
-                m = minors[nextIdx++]
+                minors[nextIdx++]
             }
-            scrapeOne(ctx, m, wantHist || m == "40505", wantHist) { arr, hObj ->
+            scrapeOne(ctx, m, wantHist || m == "40505", wantHist) { arr, hObj, err ->
+                if ((arr == null || arr.length() == 0) && !wantHist && attempt < (if (err.isNotEmpty()) 2 else 1)) {
+                    Handler(Looper.getMainLooper()).postDelayed({ launchWorker(m, attempt + 1) }, 5000L)
+                    return@scrapeOne
+                }
                 synchronized(lock) {
                     if (arr != null) {
                         for (k in 0 until arr.length()) {
@@ -218,6 +229,10 @@ object Scrape {
                             histAll.put(k, hObj.getJSONObject(k))
                         }
                     }
+                    if (arr == null || arr.length() == 0) {
+                        failed.add(m)
+                        if (err.isNotEmpty()) errs.add(err)
+                    }
                 }
                 launchWorker()
             }
@@ -231,7 +246,7 @@ object Scrape {
         minor: String,
         wantCount: Boolean,
         wantHist: Boolean,
-        cb: (JSONArray?, JSONObject?) -> Unit
+        cb: (JSONArray?, JSONObject?, String) -> Unit
     ) {
         val wm = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
         val web = WebView(ctx)
@@ -248,7 +263,7 @@ object Scrape {
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START; alpha = 0.01f }
-        try { wm.addView(web, lp) } catch (e: Exception) { cb(null, null); return }
+        try { wm.addView(web, lp) } catch (e: Exception) { cb(null, null, "無法建立隱藏視窗"); return }
 
         var done = false
         var tries = 0
@@ -259,6 +274,7 @@ object Scrape {
         val histMap = JSONObject()
         var prevSig = ""
         var stable = 0
+        var pageErr = ""
 
         fun mergedArray(): JSONArray {
             val out = JSONArray()
@@ -272,11 +288,17 @@ object Scrape {
             done = true
             handler.removeCallbacksAndMessages(null)
             try { web.destroy(); wm.removeView(web) } catch (_: Exception) {}
-            cb(arr, if (histMap.length() > 0) histMap else null)
+            cb(arr, if (histMap.length() > 0) histMap else null, pageErr)
         }
 
         web.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) { poll() }
+            override fun onReceivedError(view: WebView?, req: WebResourceRequest?, err: WebResourceError?) {
+                if (req?.isForMainFrame == true) pageErr = "網路錯誤 ${err?.description ?: "未知"}"
+            }
+            override fun onReceivedHttpError(view: WebView?, req: WebResourceRequest?, res: WebResourceResponse?) {
+                if (req?.isForMainFrame == true) pageErr = "站方 HTTP ${res?.statusCode ?: "?"}"
+            }
         }
 
         fun mergeInto(arr: JSONArray) {
@@ -364,6 +386,7 @@ object Scrape {
                 val filled = stateObj?.optInt("filled", 0) ?: 0
                 val unpriced = stateObj?.optInt("unpriced", 0) ?: 0
                 if (arr != null && arr.length() > 0) mergeInto(arr)
+                if (merged.length() == 0 && pageErr.isNotEmpty()) { finish(null); return@evaluateJavascript }
                 // 快速判定：若所有卡片皆已填入價格（或標示 -- 無掛賣），直接收工不必多等
                 if (total > 0 && filled > 0 && (filled + unpriced) >= total) {
                     onGridStable()
@@ -402,6 +425,7 @@ object Scrape {
         histAll: JSONObject,
         reqId: Long,
         minors: List<String>,
+        attempt: Int = 1,
         cb: (String) -> Unit
     ) {
         val p = pat(ctx)
@@ -496,30 +520,35 @@ object Scrape {
             } catch (e: Exception) {
                 "上傳失敗: ${e.message}"
             }
+            if (!msg.startsWith("上傳成功") && attempt < 3) {
+                Thread.sleep(3000L * attempt)
+                upload(ctx, arr, histAll, reqId, minors, attempt + 1, cb)
+                return@Thread
+            }
             Handler(Looper.getMainLooper()).post { cb(msg) }
         }.start()
     }
 
+    /** 404 視為尚未建立；網路或 HTTP 錯誤直接拋出，避免用空資料覆寫整個檔案 */
     private fun getFileWithContent(pat: String, name: String): Pair<String?, JSONObject?> {
-        var sha: String? = null
-        var json: JSONObject? = null
         val g = api(pat, "contents/$name")
         try {
-            if (g.responseCode == 200) {
-                val body = BufferedReader(InputStreamReader(g.inputStream)).readText()
-                val meta = JSONObject(body)
-                sha = meta.optString("sha").ifEmpty { null }
-                val b64 = meta.optString("content", "").replace("\n", "").replace("\r", "")
-                if (b64.isNotEmpty()) {
-                    val raw = String(android.util.Base64.decode(b64, android.util.Base64.DEFAULT))
-                    json = JSONObject(raw)
-                }
+            val code = g.responseCode
+            if (code == 404) return null to null
+            if (code != 200) throw IllegalStateException("讀取 $name 失敗 HTTP $code")
+            val meta = JSONObject(BufferedReader(InputStreamReader(g.inputStream)).readText())
+            val sha = meta.optString("sha").ifEmpty { null }
+            val b64 = meta.optString("content", "").replace("\n", "").replace("\r", "")
+            if (b64.isEmpty() && meta.optLong("size", 0L) > 0L) throw IllegalStateException("$name 檔案過大無法讀取")
+            val json = if (b64.isEmpty()) null else try {
+                JSONObject(String(android.util.Base64.decode(b64, android.util.Base64.DEFAULT)))
+            } catch (_: Exception) {
+                null
             }
-        } catch (_: Exception) {
+            return sha to json
         } finally {
             g.disconnect()
         }
-        return sha to json
     }
 
     private fun putFile(pat: String, name: String, content: String, message: String, knownSha: String? = null): String {
