@@ -961,6 +961,39 @@ async def _ensure_fresh(ctx, minor, label, timeout=None, force_old=False, mode="
         return False
 
 
+AUTO_MAX_AGE = 30 * 60  # 定時自動抓價：鑰匙報價超過 30 分鐘才請手機抓一次
+BRIEF_MAX_AGE = 10 * 60  # 定時快報發送前：鑰匙報價超過 10 分鐘就先抓一次
+AUTO_RETRY_SEC = 15 * 60  # 自動抓失敗後，15 分鐘內不重複請求
+_auto_retry = {"at": 0.0}
+
+
+def _tv_age():
+    pt, _ = quote_time_for(TV_MINOR)
+    if not pt:
+        return float("inf")
+    return (datetime.now(TAIPEI) - pt).total_seconds()
+
+
+async def refresh_quiet(max_age, wait_sec=150):
+    """不發 Discord 訊息的靜默抓價：先 pull，鑰匙報價超過 max_age 秒就請手機抓一次，等回報後重算模型"""
+    async with _fresh_lock:
+        await asyncio.to_thread(_pull)
+        if _tv_age() <= max_age:
+            return True
+        rid = await asyncio.to_thread(_request_phone, TV_MINOR, "grid")
+        if not rid:
+            return False
+        deadline = time.monotonic() + wait_sec
+        while time.monotonic() < deadline:
+            await asyncio.sleep(5)
+            await asyncio.to_thread(_pull)
+            if int((phone_prices() or {}).get("req") or 0) >= rid:
+                await asyncio.to_thread(_rebuild_models)
+                await asyncio.to_thread(_push_data)
+                return True
+        return False
+
+
 # ==================== Bot ====================
 class AbiBot(commands.Bot):
     def __init__(self):
@@ -972,6 +1005,7 @@ class AbiBot(commands.Bot):
     async def setup_hook(self):
         self.alert_loop.start()
         self.brief_loop.start()
+        self.auto_refresh_loop.start()
 
     def snapshot(self):
         snap = load_json(SNAPSHOT, {}) or {}
@@ -1055,6 +1089,10 @@ class AbiBot(commands.Bot):
         if not chan_id:
             return
         try:
+            try:
+                await refresh_quiet(BRIEF_MAX_AGE)
+            except Exception as e:
+                print("brief refresh fail:", e)
             chan = self.get_channel(int(chan_id)) or await self.fetch_channel(int(chan_id))
             txt = daily_brief_text(self.snapshot(), role_tag(getattr(chan, "guild", None)))
             if not txt:
@@ -1066,6 +1104,23 @@ class AbiBot(commands.Bot):
 
     @brief_loop.before_loop
     async def before_brief(self):
+        await self.wait_until_ready()
+
+    @tasks.loop(minutes=10)
+    async def auto_refresh_loop(self):
+        """定時自動抓鑰匙報價，讓訊號警示與快報不會一直用舊資料"""
+        if time.time() < _auto_retry["at"]:
+            return
+        try:
+            ok = await refresh_quiet(AUTO_MAX_AGE)
+        except Exception as e:
+            print("auto refresh fail:", e)
+            ok = False
+        if not ok:
+            _auto_retry["at"] = time.time() + AUTO_RETRY_SEC
+
+    @auto_refresh_loop.before_loop
+    async def before_auto_refresh(self):
         await self.wait_until_ready()
 
 
